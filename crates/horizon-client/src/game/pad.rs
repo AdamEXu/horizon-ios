@@ -42,6 +42,9 @@ pub(super) struct Pads {
     injected: PadState,
     /// The virtual pad was in use at the last poll.
     virtual_input: bool,
+    /// The touch controls press the virtual pad, not a controller or an agent: they play, but the
+    /// pad isn't "in use" (no controller guide, glyphs or menu focus for buttons on the screen).
+    touch_driven: bool,
     /// Buttons a `pad ... tap` releases at the next poll.
     taps: Vec<Button>,
     edges: Edges,
@@ -206,11 +209,13 @@ impl Pads {
     }
 
     /// The virtual pad's state, for the touch controls (game/touch.rs).
-    pub(super) fn injected_mut(&mut self) -> &mut PadState {
+    pub(super) fn touch_mut(&mut self) -> &mut PadState {
+        self.touch_driven = true;
         &mut self.injected
     }
     /// A replay's pad button, in place of `pad`'s line.
     pub(super) fn inject_button(&mut self, button: Button, down: bool) {
+        self.touch_driven = false;
         self.injected.set(button, down);
     }
     /// Splitscreen: this player's pad state, from `source`. Another pad, or
@@ -342,7 +347,12 @@ impl Game<'_> {
         }
         let threshold = self.settings.controller.trigger_threshold;
         let edges = self.pad.edges.update(&state, threshold);
-        if activity && self.pad_focused() {
+        if hardware != PadState::default() {
+            self.pad.touch_driven = false;
+        }
+        if self.pad.touch_driven {
+            self.pad.in_use = false;
+        } else if activity && self.pad_focused() {
             self.last_input = Instant::now();
             self.pad.in_use = true;
             self.pad.keyboard_took_over = false;
@@ -740,6 +750,7 @@ impl Game<'_> {
     }
 
     pub(super) fn pad_command(&mut self, words: &[&str]) -> Result<Value> {
+        self.pad.touch_driven = false;
         let arg = |i: usize| -> Result<&str> {
             words
                 .get(i)

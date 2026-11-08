@@ -219,7 +219,7 @@ impl Game<'_> {
     }
 
     fn touch_press(&mut self, button: Button, down: bool) {
-        let state = self.pad.injected_mut();
+        let state = self.pad.touch_mut();
         match button {
             Button::LeftTrigger => state.triggers[0] = if down { 1.0 } else { 0.0 },
             Button::RightTrigger => state.triggers[1] = if down { 1.0 } else { 0.0 },
@@ -237,7 +237,7 @@ impl Game<'_> {
         for control in Control::ALL {
             self.touch_press(control.button(), false);
         }
-        self.pad.injected_mut().left = [0.0; 2];
+        self.pad.touch_mut().left = [0.0; 2];
         self.touch.taps.clear();
         self.touch.releasing.clear();
         for role in self.touch.fingers.values_mut() {
@@ -341,7 +341,7 @@ impl Game<'_> {
                 if len > 1.0 {
                     v = [v[0] / len, v[1] / len];
                 }
-                self.pad.injected_mut().left = if ended { [0.0; 2] } else { v };
+                self.pad.touch_mut().left = if ended { [0.0; 2] } else { v };
                 self.touch
                     .fingers
                     .insert(finger, Role::Stick { origin, at: gui });

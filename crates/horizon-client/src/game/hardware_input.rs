@@ -272,9 +272,15 @@ impl Game<'_> {
         horizon_ios_input::watch_pointer_touches(&window);
         let id = window.id();
         for input in horizon_ios_input::poll() {
+            let was_active = self.hardware.active();
             let pointer = self.hardware_pointer(&window);
             for out in self.hardware.translate(input, pointer, false) {
                 self.hardware_out(event_loop, id, out);
+            }
+            if !was_active && self.hardware.active() {
+                // The keyboard and mouse take over from the touch buttons' virtual pad.
+                self.pad_yield_input(event_loop);
+                self.pad.keyboard_took_over = true;
             }
         }
         for out in self.hardware.frame(false) {
