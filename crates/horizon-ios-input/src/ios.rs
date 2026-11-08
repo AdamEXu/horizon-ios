@@ -1,19 +1,20 @@
 use crate::Input;
 use block2::RcBlock;
 use objc2::encode::Encode;
-use objc2::rc::Retained;
+use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Imp, Sel};
 use objc2::{msg_send, sel};
-use objc2_foundation::{NSArray, NSNumber};
+use objc2_core_foundation::CGPoint;
+use objc2_foundation::{NSArray, NSNumber, NSString};
 use objc2_game_controller::{
     GCControllerButtonInput, GCControllerDirectionPad, GCDevice, GCKeyCode, GCKeyboard,
     GCKeyboardInput, GCMouse, GCMouseInput,
 };
 use std::cell::RefCell;
-use std::ffi::{CString, c_float};
+use std::ffi::{CStr, CString, c_float};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, Once, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, Once, PoisonError};
 use std::time::{Duration, Instant};
 use winit::event::{ElementState, KeyEvent, MouseButton};
 use winit::keyboard::{Key, KeyCode, KeyLocation, PhysicalKey, SmolStr};
@@ -174,7 +175,7 @@ fn watch_mouse(mouse: &GCMouse) {
         let scrolled = RcBlock::new(
             |_: NonNull<GCControllerDirectionPad>, x: c_float, y: c_float| {
                 if x != 0.0 || y != 0.0 {
-                    push(Input::Scroll {
+                    push(Input::Wheel {
                         dx: -f64::from(y),
                         dy: f64::from(x),
                     });
@@ -279,14 +280,104 @@ extern "C-unwind" fn prefers_pointer_locked(_: &AnyObject, _: Sel) -> Bool {
     Bool::new(POINTER_LOCKED.load(Ordering::Relaxed))
 }
 
+/// The window's root view controller, which UIKit asks whether to lock the pointer.
+///
+/// # Safety
+///
+/// `view` is a live UIView, on the main thread.
+unsafe fn root_controller(view: &AnyObject) -> Option<Retained<AnyObject>> {
+    // SAFETY: UIKit property reads.
+    unsafe {
+        let window: Option<Retained<AnyObject>> = msg_send![view, window];
+        msg_send![&*window?, rootViewController]
+    }
+}
+
+/// The scene's state for the log: whether it is there, its activation, the lock.
+///
+/// # Safety
+///
+/// As [`root_controller`].
+unsafe fn describe_scene(view: &AnyObject) -> String {
+    // SAFETY: UIKit property reads (iOS 13 and 14).
+    unsafe {
+        let window: Option<Retained<AnyObject>> = msg_send![view, window];
+        let Some(window) = window else {
+            return "no window".to_owned();
+        };
+        let scene: Option<Retained<AnyObject>> = msg_send![&*window, windowScene];
+        let Some(scene) = scene else {
+            return "no window scene".to_owned();
+        };
+        let activation: isize = msg_send![&*scene, activationState];
+        let activation = match activation {
+            0 => "foreground active",
+            1 => "foreground inactive",
+            2 => "background",
+            _ => "unattached",
+        };
+        format!("scene {activation}, locked {:?}", view_locked(view))
+    }
+}
+
+/// Logs each change of the pointer lock the system makes (`UIPointerLockStateDidChangeNotification`).
+fn watch_lock_state() {
+    static WATCHING: Once = Once::new();
+    WATCHING.call_once(|| {
+        #[link(name = "UIKit", kind = "framework")]
+        unsafe extern "C" {
+            static UIPointerLockStateDidChangeNotification: &'static NSString;
+        }
+        let changed = RcBlock::new(|note: NonNull<AnyObject>| {
+            // SAFETY: the notification's object is the scene's `UIPointerLockState`.
+            unsafe {
+                let state: Option<Retained<AnyObject>> = msg_send![note.as_ref(), object];
+                let Some(state) = state else {
+                    return;
+                };
+                let answers: Bool = msg_send![&*state, respondsToSelector: sel!(isLocked)];
+                if answers.as_bool() {
+                    let locked: Bool = msg_send![&*state, isLocked];
+                    log::info!(
+                        "Horizon: the system's pointer lock changed: locked {}",
+                        locked.as_bool()
+                    );
+                }
+            }
+        });
+        // SAFETY: NSNotificationCenter on the main thread; the observer lives as long as the app.
+        unsafe {
+            let center: Retained<AnyObject> = msg_send![
+                AnyClass::get(c"NSNotificationCenter").expect("Foundation"),
+                defaultCenter
+            ];
+            let nil = std::ptr::null_mut::<AnyObject>();
+            let observer: Option<Retained<AnyObject>> = msg_send![
+                &*center,
+                addObserverForName: UIPointerLockStateDidChangeNotification,
+                object: nil,
+                queue: nil,
+                usingBlock: &*changed
+            ];
+            std::mem::forget(observer);
+        }
+    });
+}
+
 /// Locks the pointer (hidden, only GameController's movement) or frees it. UIKit asks the window's
 /// root view controller, and winit's doesn't answer, so its class gets the method.
 pub fn set_pointer_locked(window: &Window, locked: bool) {
-    let Some(controller) = ui_handle(window).and_then(|h| h.ui_view_controller) else {
+    let Some(handle) = ui_handle(window) else {
         return;
     };
-    // SAFETY: winit's handle points at its live `WinitUIViewController`.
-    let controller: &AnyObject = unsafe { controller.cast().as_ref() };
+    // SAFETY: winit's handle points at its live view.
+    let view: &AnyObject = unsafe { handle.ui_view.cast().as_ref() };
+    // SAFETY: as above.
+    let Some(controller) = (unsafe { root_controller(view) }) else {
+        log::warn!("Horizon: no root view controller to lock the pointer with");
+        return;
+    };
+    watch_lock_state();
     static ADD_METHOD: Once = Once::new();
     ADD_METHOD.call_once(|| {
         let types = CString::new(format!("{}@:", Bool::ENCODING)).expect("no NUL in an encoding");
@@ -303,25 +394,62 @@ pub fn set_pointer_locked(window: &Window, locked: bool) {
                 types.as_ptr(),
             )
         };
-        if !added.as_bool() {
-            log::warn!("Horizon: winit's view controller already answers prefersPointerLocked");
-        }
+        let winit = handle.ui_view_controller.is_some_and(|c| {
+            c.as_ptr().cast::<AnyObject>() == Retained::as_ptr(&controller).cast_mut()
+        });
+        log::info!(
+            "Horizon: root view controller {} (winit's: {winit}) answers prefersPointerLocked: {}",
+            controller.class().name().to_string_lossy(),
+            if added.as_bool() {
+                "added"
+            } else {
+                "it already did"
+            },
+        );
     });
-    if POINTER_LOCKED.swap(locked, Ordering::Relaxed) != locked {
-        // SAFETY: a UIViewController method (iOS 14), on the main thread.
-        unsafe {
-            let _: () = msg_send![controller, setNeedsUpdateOfPrefersPointerLocked];
-        }
+    POINTER_LOCKED.store(locked, Ordering::Relaxed);
+    // SAFETY: a UIViewController method (iOS 14), on the main thread; then property reads.
+    unsafe {
+        let _: () = msg_send![&*controller, setNeedsUpdateOfPrefersPointerLocked];
+        let answer: Bool = msg_send![&*controller, prefersPointerLocked];
+        log::info!(
+            "Horizon: pointer lock requested: {locked} (the view controller answers {}; {})",
+            answer.as_bool(),
+            describe_scene(view)
+        );
     }
 }
 
-/// Whether the system has locked the pointer (it may refuse, as for a window that doesn't fill
-/// the screen); `None` before the window has a scene.
+/// Whether the system has locked the pointer (it may refuse); `None` before the window has a
+/// scene.
 pub fn pointer_lock_state(window: &Window) -> Option<bool> {
     let view = ui_handle(window)?.ui_view;
-    // SAFETY: winit's handle points at its live view; these are UIKit property reads (iOS 14).
+    // SAFETY: winit's handle points at its live view.
+    unsafe { view_locked(view.cast().as_ref()) }
+}
+
+/// Where the system's pointer is, in window pixels; `None` while the pointer is locked, when the
+/// system still sends the pointer's clicks as touches, at a place that isn't where anything is
+/// (the window's corner).
+///
+/// # Safety
+///
+/// `view` is a live UIView, on the main thread.
+unsafe fn pointer_place(view: &AnyObject, at: CGPoint) -> Option<(f64, f64)> {
+    if POINTER_LOCKED.load(Ordering::Relaxed) || unsafe { view_locked(view) } == Some(true) {
+        return None;
+    }
+    // SAFETY: a UIView property read.
+    let scale: f64 = unsafe { msg_send![view, contentScaleFactor] };
+    Some((at.x * scale, at.y * scale))
+}
+
+/// # Safety
+///
+/// As [`pointer_place`].
+unsafe fn view_locked(view: &AnyObject) -> Option<bool> {
+    // SAFETY: UIKit property reads (iOS 14).
     unsafe {
-        let view: &AnyObject = view.cast().as_ref();
         let window: Option<Retained<AnyObject>> = msg_send![view, window];
         let scene: Option<Retained<AnyObject>> = msg_send![&*window?, windowScene];
         let state: Option<Retained<AnyObject>> = msg_send![&*scene?, pointerLockState];
@@ -330,84 +458,255 @@ pub fn pointer_lock_state(window: &Window) -> Option<bool> {
     }
 }
 
-extern "C-unwind" fn pointer_touches_began(
-    _: *mut AnyObject,
+/// # Safety
+///
+/// `recognizer` is a live gesture recognizer, on the main thread.
+unsafe fn recognizer_view(recognizer: *mut AnyObject) -> Option<Retained<AnyObject>> {
+    // SAFETY: a UIGestureRecognizer property read.
+    unsafe { msg_send![recognizer, view] }
+}
+
+/// `UIEventButtonMask` bits: primary, secondary, then the buttons by number.
+const BUTTONS: [MouseButton; 5] = [
+    MouseButton::Left,
+    MouseButton::Right,
+    MouseButton::Middle,
+    MouseButton::Back,
+    MouseButton::Forward,
+];
+
+/// The pointer's touch's buttons as last reported.
+static TOUCH_BUTTONS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Began,
+    Moved,
+    Ended,
+}
+
+/// A pointer touch's place, and its buttons pressed or let go there (the event's `buttonMask`).
+///
+/// # Safety
+///
+/// UIKit's arguments to a touch method of the live recognizer `this`, on the main thread.
+unsafe fn pointer_touches(
+    this: *mut AnyObject,
+    touches: *mut AnyObject,
+    event: *mut AnyObject,
+    phase: Phase,
+) {
+    // SAFETY: as the function's.
+    unsafe {
+        let touches: Option<Retained<NSArray<AnyObject>>> = msg_send![touches, allObjects];
+        let (Some(touches), Some(view)) = (touches, recognizer_view(this)) else {
+            return;
+        };
+        let Some(touch) = touches.to_vec().pop() else {
+            return;
+        };
+        let at: CGPoint = msg_send![&*touch, locationInView: std::ptr::null_mut::<AnyObject>()];
+        let before = match phase {
+            Phase::Began => 0,
+            _ => TOUCH_BUTTONS.load(Ordering::Relaxed),
+        };
+        let now = match phase {
+            Phase::Ended => 0,
+            _ if event.is_null() => before,
+            _ => msg_send![event, buttonMask],
+        };
+        TOUCH_BUTTONS.store(now, Ordering::Relaxed);
+        let Some((x, y)) = pointer_place(&view, at) else {
+            return;
+        };
+        if before == now {
+            push(Input::Pointer { x, y });
+        }
+        for (bit, button) in BUTTONS.into_iter().enumerate() {
+            let (was, is) = (before >> bit & 1 == 1, now >> bit & 1 == 1);
+            if was != is {
+                push(Input::Click {
+                    x,
+                    y,
+                    button,
+                    pressed: is,
+                });
+            }
+        }
+    }
+}
+
+extern "C-unwind" fn pointer_touches_moved(
+    this: *mut AnyObject,
     _: Sel,
     touches: *mut AnyObject,
-    _: *mut AnyObject,
+    event: *mut AnyObject,
+) {
+    // SAFETY: UIKit calls with its own arguments, on the main thread.
+    unsafe { pointer_touches(this, touches, event, Phase::Moved) }
+}
+
+extern "C-unwind" fn pointer_touches_began(
+    this: *mut AnyObject,
+    _: Sel,
+    touches: *mut AnyObject,
+    event: *mut AnyObject,
 ) {
     // SAFETY: UIKit passes an `NSSet<UITouch *>`.
-    let touches: Option<Retained<NSArray<AnyObject>>> = unsafe { msg_send![touches, allObjects] };
-    let Some(touches) = touches else {
-        return;
-    };
-    let mut ids = POINTER_TOUCHES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    for touch in touches.to_vec() {
-        ids.push(Retained::as_ptr(&touch) as usize as u64);
+    let all: Option<Retained<NSArray<AnyObject>>> = unsafe { msg_send![touches, allObjects] };
+    if let Some(all) = all {
+        let mut ids = POINTER_TOUCHES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for touch in all.to_vec() {
+            ids.push(Retained::as_ptr(&touch) as usize as u64);
+        }
+        // Touches whose end never reached the game: keep the list short.
+        let excess = ids.len().saturating_sub(16);
+        ids.drain(..excess);
     }
-    // Touches whose end never reached the game: keep the list short.
-    let excess = ids.len().saturating_sub(16);
-    ids.drain(..excess);
+    // SAFETY: as in `pointer_touches_moved`.
+    unsafe { pointer_touches(this, touches, event, Phase::Began) }
 }
 
 extern "C-unwind" fn pointer_touches_ended(
     this: *mut AnyObject,
     _: Sel,
-    _: *mut AnyObject,
-    _: *mut AnyObject,
+    touches: *mut AnyObject,
+    event: *mut AnyObject,
 ) {
-    // UIGestureRecognizerStateFailed: the recognizer resets for the next touch, having never
-    // recognized anything or held a touch back from the view.
-    // SAFETY: `setState:` is UIGestureRecognizer's, for subclasses.
+    // SAFETY: as in `pointer_touches_moved`, then `setState:`, UIGestureRecognizer's for
+    // subclasses: UIGestureRecognizerStateFailed resets the recognizer for the next touch,
+    // having never recognized anything or held a touch back from the view.
     unsafe {
+        pointer_touches(this, touches, event, Phase::Ended);
         let _: () = msg_send![this, setState: 5isize];
     }
 }
 
-/// A gesture recognizer on winit's view that sees only the pointer's touches, before the view
-/// does (winit's `Touch` doesn't say what made it), and lets them all through.
-pub fn watch_pointer_touches(window: &Window) {
+/// UIGestureRecognizerStateBegan or Changed.
+fn moving(state: isize) -> bool {
+    matches!(state, 1 | 2)
+}
+
+extern "C-unwind" fn hovered(_: *mut AnyObject, _: Sel, recognizer: *mut AnyObject) {
+    // SAFETY: UIKit calls the action with its live recognizer, on the main thread.
+    unsafe {
+        let state: isize = msg_send![recognizer, state];
+        let Some(view) = recognizer_view(recognizer).filter(|_| moving(state)) else {
+            return;
+        };
+        let at: CGPoint = msg_send![recognizer, locationInView: std::ptr::null_mut::<AnyObject>()];
+        if let Some((x, y)) = pointer_place(&view, at) {
+            push(Input::Pointer { x, y });
+        }
+    }
+}
+
+extern "C-unwind" fn scrolled(_: *mut AnyObject, _: Sel, recognizer: *mut AnyObject) {
+    // SAFETY: as in `hovered`.
+    unsafe {
+        let state: isize = msg_send![recognizer, state];
+        let Some(view) = recognizer_view(recognizer).filter(|_| moving(state)) else {
+            return;
+        };
+        let nil = std::ptr::null_mut::<AnyObject>();
+        let by: CGPoint = msg_send![recognizer, translationInView: nil];
+        let _: () = msg_send![recognizer, setTranslation: CGPoint::ZERO, inView: nil];
+        let scale: f64 = msg_send![&*view, contentScaleFactor];
+        if by != CGPoint::ZERO {
+            push(Input::Scroll {
+                dx: by.x * scale,
+                dy: by.y * scale,
+            });
+        }
+    }
+}
+
+fn define(
+    name: &CStr,
+    superclass: &CStr,
+    methods: impl FnOnce(&mut ClassBuilder),
+) -> &'static AnyClass {
+    let superclass = AnyClass::get(superclass).expect("UIKit is loaded");
+    let mut builder = ClassBuilder::new(name, superclass).expect("the class is defined once");
+    methods(&mut builder);
+    builder.register()
+}
+
+/// Watches the system's pointer on winit's view while it isn't locked: where it hovers, which
+/// touches it makes (winit's `Touch` doesn't say what made it) and where they go, and scrolling
+/// (the wheel, two fingers on the trackpad). None of it holds a touch back from the view.
+pub fn watch_pointer(window: &Window) {
     static WATCHING: Once = Once::new();
-    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
     let Some(handle) = ui_handle(window) else {
         return;
     };
     WATCHING.call_once(|| {
-        let class = CLASS.get_or_init(|| {
-            let superclass = AnyClass::get(c"UIGestureRecognizer").expect("UIKit is loaded");
-            let mut builder = ClassBuilder::new(c"HorizonPointerTouches", superclass)
-                .expect("the class is defined once");
-            type Touches =
-                extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject);
-            // SAFETY: the signatures of UIResponder's touch methods.
+        type Touches = extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject);
+        type Action = extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject);
+        let touches = define(
+            c"HorizonPointerTouches",
+            c"UIGestureRecognizer",
+            |builder| {
+                // SAFETY: the signatures of UIResponder's touch methods.
+                unsafe {
+                    builder.add_method(
+                        sel!(touchesBegan:withEvent:),
+                        pointer_touches_began as Touches,
+                    );
+                    builder.add_method(
+                        sel!(touchesMoved:withEvent:),
+                        pointer_touches_moved as Touches,
+                    );
+                    builder.add_method(
+                        sel!(touchesEnded:withEvent:),
+                        pointer_touches_ended as Touches,
+                    );
+                    builder.add_method(
+                        sel!(touchesCancelled:withEvent:),
+                        pointer_touches_ended as Touches,
+                    );
+                }
+            },
+        );
+        let target = define(c"HorizonPointerTarget", c"NSObject", |builder| {
+            // SAFETY: gesture recognizer actions take the recognizer.
             unsafe {
-                builder.add_method(
-                    sel!(touchesBegan:withEvent:),
-                    pointer_touches_began as Touches,
-                );
-                builder.add_method(
-                    sel!(touchesEnded:withEvent:),
-                    pointer_touches_ended as Touches,
-                );
-                builder.add_method(
-                    sel!(touchesCancelled:withEvent:),
-                    pointer_touches_ended as Touches,
-                );
+                builder.add_method(sel!(hover:), hovered as Action);
+                builder.add_method(sel!(scroll:), scrolled as Action);
             }
-            builder.register()
         });
-        // UITouchTypeIndirectPointer.
-        let types = NSArray::from_retained_slice(&[NSNumber::numberWithInteger(3)]);
-        // SAFETY: UIKit calls on the main thread; the view retains the recognizer.
+        let pointer_only = NSArray::from_retained_slice(&[NSNumber::numberWithInteger(3)]);
+        let no_touches = NSArray::<NSNumber>::new();
+        // SAFETY: UIKit calls on the main thread. The view retains its recognizers; they don't
+        // retain their target, which lives as long as the app.
         unsafe {
             let view: &AnyObject = handle.ui_view.cast().as_ref();
-            let recognizer: Retained<AnyObject> = msg_send![*class, new];
-            let _: () = msg_send![&*recognizer, setCancelsTouchesInView: false];
-            let _: () = msg_send![&*recognizer, setDelaysTouchesEnded: false];
-            let _: () = msg_send![&*recognizer, setAllowedTouchTypes: &*types];
-            let _: () = msg_send![view, addGestureRecognizer: &*recognizer];
+            let target: Retained<AnyObject> = msg_send![target, new];
+            let target = &*Retained::into_raw(target);
+            let quiet = |recognizer: &AnyObject| {
+                let _: () = msg_send![recognizer, setCancelsTouchesInView: false];
+                let _: () = msg_send![recognizer, setDelaysTouchesEnded: false];
+                let _: () = msg_send![view, addGestureRecognizer: recognizer];
+            };
+            let recognizer: Retained<AnyObject> = msg_send![touches, new];
+            // UITouchTypeIndirectPointer.
+            let _: () = msg_send![&*recognizer, setAllowedTouchTypes: &*pointer_only];
+            quiet(&recognizer);
+            let class = AnyClass::get(c"UIHoverGestureRecognizer").expect("UIKit is loaded");
+            let recognizer: Allocated<AnyObject> = msg_send![class, alloc];
+            let recognizer: Retained<AnyObject> =
+                msg_send![recognizer, initWithTarget: target, action: sel!(hover:)];
+            quiet(&recognizer);
+            let class = AnyClass::get(c"UIPanGestureRecognizer").expect("UIKit is loaded");
+            let recognizer: Allocated<AnyObject> = msg_send![class, alloc];
+            let recognizer: Retained<AnyObject> =
+                msg_send![recognizer, initWithTarget: target, action: sel!(scroll:)];
+            // Scrolling only (UIScrollTypeMaskAll), no touches: fingers stay the game's.
+            let _: () = msg_send![&*recognizer, setAllowedScrollTypesMask: 3usize];
+            let _: () = msg_send![&*recognizer, setAllowedTouchTypes: &*no_touches];
+            quiet(&recognizer);
         }
     });
 }

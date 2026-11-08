@@ -270,7 +270,6 @@ impl Loading {
         };
         let mut batch = HudBatch::new(size);
         self.draw_menu(&mut batch);
-        self.draw_hardware_cursor(&mut batch);
         self.menu.frame_drawn((batch.width, batch.height));
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(
@@ -425,7 +424,6 @@ impl ApplicationHandler for App {
             App::Loading(loading) => match event {
                 WindowEvent::Touch(touch) => {
                     if super::touch::is_pointer(&touch) {
-                        loading.window_event(event_loop, id, super::touch::pointer_at(&touch));
                         return;
                     }
                     if touch.phase == winit::event::TouchPhase::Started {

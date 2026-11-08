@@ -1,31 +1,35 @@
 //! Hardware keyboards and mice on iPadOS (`horizon-ios-input`), turned into the window events the
 //! desktop's keyboard and mouse send, so every screen and binding takes them as it does there.
 //!
-//! The pointer stays locked while a mouse is in use: in play the mouse's movement turns the view
-//! (`MouseHandler.onMove`, as the desktop's raw motion), and over screens it moves the game's own
-//! cursor, which the game draws, so hover works without a button held. Keys come from
-//! GameController; typed text comes from UIKit (winit's `insertText:`), which knows the layout,
-//! while a text field has the keyboard focus. Touching the screen hands control back to the touch
-//! controls.
+//! As the desktop grabs the mouse only in play, the pointer is locked only while the game holds it:
+//! there GameController's raw movement turns the view (`MouseHandler.onMove`), and its buttons
+//! and wheel act. Over screens the system's own pointer shows, and everything comes from UIKit's
+//! pointer events: hovering and dragging move the cursor, and each press and release first moves
+//! it to where that event happened, as a desktop's mouse reports a move before a click. Keys come
+//! from GameController; typed text comes from UIKit (winit's `insertText:`), which knows the
+//! layout, while a text field has the keyboard focus. Touching the screen hands control back to
+//! the touch controls.
 use super::Game;
 use super::event_loop::EventLoopCtl;
 use super::loading_screen::Loading;
-use horizon_client::hud::{HudAtlas, HudBatch, rgba};
 use horizon_ios_input::Input;
 use std::time::{Duration, Instant};
 use winit::dpi::PhysicalPosition;
-use winit::event::{DeviceId, ElementState, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{
+    DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
+};
 use winit::keyboard::{KeyCode, ModifiersState};
 use winit::window::{Window, WindowId};
 
 /// A held key starts repeating after this, then repeats this often (iPadOS' defaults).
 const REPEAT_DELAY: Duration = Duration::from_millis(500);
 const REPEAT_EVERY: Duration = Duration::from_millis(50);
-/// How far the mouse moves (points) before it takes over from the touch controls: a palm
-/// brushing the trackpad while playing by touch does nothing.
+/// How far the mouse moves (GameController's units) before it takes over from the touch
+/// controls: a palm brushing the trackpad while playing by touch does nothing.
 const WAKE_MOTION: f64 = 40.0;
+/// How long the system may take to lock or free the pointer before it is asked again.
+const LOCK_RETRY: Duration = Duration::from_secs(1);
 
-#[derive(Default)]
 pub(super) struct HardwareInput {
     /// A keyboard or mouse is what the player uses now: the touch controls hide.
     active: bool,
@@ -33,20 +37,32 @@ pub(super) struct HardwareInput {
     modifiers: ModifiersState,
     repeat: Option<(KeyCode, Instant)>,
     lock_wanted: bool,
+    /// When the lock was last asked for, and how many times since `lock_wanted` changed.
+    lock_asked: (Instant, u32),
     lock_seen: Option<bool>,
     /// Mouse movement while the touch controls are in use, towards [`WAKE_MOTION`].
     stray_motion: f64,
+    /// The game holds the pointer (the last input's view of it).
+    grabbed: bool,
+    /// Mouse buttons the game has down.
+    buttons: Vec<MouseButton>,
 }
 
-/// Where the pointer is for the input being translated.
-#[derive(Clone, Copy)]
-pub(super) struct Pointer {
-    /// The game holds the pointer: the mouse turns the view.
-    pub(super) grabbed: bool,
-    /// The cursor, in window pixels.
-    pub(super) at: (f64, f64),
-    pub(super) size: [u32; 2],
-    pub(super) scale_factor: f64,
+impl Default for HardwareInput {
+    fn default() -> Self {
+        Self {
+            active: false,
+            held: Vec::new(),
+            modifiers: ModifiersState::empty(),
+            repeat: None,
+            lock_wanted: false,
+            lock_asked: (Instant::now(), 0),
+            lock_seen: None,
+            stray_motion: 0.0,
+            grabbed: false,
+            buttons: Vec::new(),
+        }
+    }
 }
 
 pub(super) enum Out {
@@ -65,6 +81,33 @@ fn modifier(code: KeyCode) -> Option<ModifiersState> {
     })
 }
 
+fn click(button: MouseButton, pressed: bool) -> Out {
+    Out::Event(WindowEvent::MouseInput {
+        device_id: DeviceId::dummy(),
+        state: if pressed {
+            ElementState::Pressed
+        } else {
+            ElementState::Released
+        },
+        button,
+    })
+}
+
+fn wheel(delta: MouseScrollDelta) -> Out {
+    Out::Event(WindowEvent::MouseWheel {
+        device_id: DeviceId::dummy(),
+        delta,
+        phase: TouchPhase::Moved,
+    })
+}
+
+fn moved(x: f64, y: f64) -> Out {
+    Out::Event(WindowEvent::CursorMoved {
+        device_id: DeviceId::dummy(),
+        position: PhysicalPosition::new(x, y),
+    })
+}
+
 impl HardwareInput {
     pub(super) fn active(&self) -> bool {
         self.active
@@ -77,11 +120,6 @@ impl HardwareInput {
         }
         self.active = false;
         self.stray_motion = 0.0;
-    }
-
-    /// The game draws the cursor: a mouse in use and the pointer not grabbed.
-    pub(super) fn cursor_shown(&self, grabbed: bool) -> bool {
-        self.active && !grabbed && horizon_ios_input::mouse_connected()
     }
 
     fn key(&self, code: KeyCode, state: ElementState, repeat: bool, text: bool) -> Option<Out> {
@@ -147,26 +185,56 @@ impl HardwareInput {
         out.extend(self.key(code, state, false, text));
     }
 
-    /// One input as window events. `text`: the keys carry the characters they type on a US
-    /// layout, for a window UIKit sends no text to.
-    pub(super) fn translate(&mut self, input: Input, pointer: Pointer, text: bool) -> Vec<Out> {
+    /// The game took or let go of the pointer: the buttons held through it are let go, since
+    /// their releases would come from the source the game no longer reads (GameController's in
+    /// play, UIKit's over screens).
+    fn grab(&mut self, grabbed: bool, out: &mut Vec<Out>) {
+        if grabbed != self.grabbed {
+            self.grabbed = grabbed;
+            out.extend(self.buttons.drain(..).map(|b| click(b, false)));
+        }
+    }
+
+    fn button(&mut self, button: MouseButton, pressed: bool, out: &mut Vec<Out>) {
+        if pressed == self.buttons.contains(&button) {
+            return;
+        }
+        if pressed {
+            self.buttons.push(button);
+        } else {
+            self.buttons.retain(|&b| b != button);
+        }
+        out.push(click(button, pressed));
+    }
+
+    /// One input as window events. `grabbed`: the game holds the pointer now. `text`: the keys
+    /// carry the characters they type on a US layout, for a window UIKit sends no text to.
+    pub(super) fn translate(&mut self, input: Input, grabbed: bool, text: bool) -> Vec<Out> {
         let mut out = Vec::new();
-        // A key let go still reaches the game, whichever input is in use.
-        let release = matches!(input, Input::Key { pressed: false, .. });
+        self.grab(grabbed, &mut out);
+        // A key or button let go still reaches the game, whichever input is in use.
+        let release = matches!(
+            input,
+            Input::Key { pressed: false, .. }
+                | Input::Button { pressed: false, .. }
+                | Input::Click { pressed: false, .. }
+        );
         if !self.active && !release {
             let wakes = match input {
-                Input::Key { .. } => true,
                 Input::Motion { dx, dy } => {
                     self.stray_motion += dx.abs() + dy.abs();
                     self.stray_motion >= WAKE_MOTION
                 }
-                Input::Button { .. } | Input::Scroll { .. } => true,
+                // An Apple Pencil hovering moves the pointer too.
+                Input::Pointer { .. } => false,
+                _ => true,
             };
-            if !wakes {
+            if wakes {
+                log::info!("Horizon: keyboard and mouse are the input in use");
+                self.active = true;
+            } else if !matches!(input, Input::Pointer { .. }) {
                 return out;
             }
-            log::info!("Horizon: keyboard and mouse are the input in use");
-            self.active = true;
         }
         match input {
             Input::Key { usage, pressed } => {
@@ -174,37 +242,34 @@ impl HardwareInput {
                     self.press(code, pressed, text, &mut out);
                 }
             }
-            Input::Motion { dx, dy } if pointer.grabbed => out.push(Out::Look(dx, dy)),
-            Input::Motion { dx, dy } => {
-                let max = |n: u32| f64::from(n.saturating_sub(1));
-                let x = (pointer.at.0 + dx * pointer.scale_factor).clamp(0.0, max(pointer.size[0]));
-                let y = (pointer.at.1 + dy * pointer.scale_factor).clamp(0.0, max(pointer.size[1]));
-                out.push(Out::Event(WindowEvent::CursorMoved {
-                    device_id: DeviceId::dummy(),
-                    position: PhysicalPosition::new(x, y),
-                }));
+            Input::Motion { dx, dy } if grabbed => out.push(Out::Look(dx, dy)),
+            Input::Button { button, pressed } if grabbed => self.button(button, pressed, &mut out),
+            Input::Wheel { dx, dy } if grabbed => {
+                out.push(wheel(MouseScrollDelta::LineDelta(dx as f32, dy as f32)));
             }
-            Input::Button { button, pressed } => out.push(Out::Event(WindowEvent::MouseInput {
-                device_id: DeviceId::dummy(),
-                state: if pressed {
-                    ElementState::Pressed
-                } else {
-                    ElementState::Released
-                },
+            Input::Pointer { x, y } if !grabbed => out.push(moved(x, y)),
+            Input::Click {
+                x,
+                y,
                 button,
-            })),
-            Input::Scroll { dx, dy } => out.push(Out::Event(WindowEvent::MouseWheel {
-                device_id: DeviceId::dummy(),
-                delta: MouseScrollDelta::LineDelta(dx as f32, dy as f32),
-                phase: TouchPhase::Moved,
-            })),
+                pressed,
+            } if !grabbed => {
+                out.push(moved(x, y));
+                self.button(button, pressed, &mut out);
+            }
+            Input::Scroll { dx, dy } if !grabbed => {
+                let delta = MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx, dy));
+                out.push(wheel(delta));
+            }
+            _ => {}
         }
         out
     }
 
     /// Once a frame: the held key's repeat, and every key let go if the keyboard went away.
-    pub(super) fn frame(&mut self, text: bool) -> Vec<Out> {
+    pub(super) fn frame(&mut self, grabbed: bool, text: bool) -> Vec<Out> {
         let mut out = Vec::new();
+        self.grab(grabbed, &mut out);
         if !horizon_ios_input::keyboard_connected() && !self.held.is_empty() {
             for code in self.held.clone() {
                 self.press(code, false, text, &mut out);
@@ -219,15 +284,30 @@ impl HardwareInput {
         out
     }
 
-    /// Locks the pointer while a mouse is in use and the app is in front; logs what the system
-    /// made of it.
-    pub(super) fn sync_pointer_lock(&mut self, window: &Window, focused: bool) {
-        let wanted = self.active && focused && horizon_ios_input::mouse_connected();
+    /// Locks the pointer while the game holds it (in play) and the app is in front, as the
+    /// desktop grabs the mouse; logs what the system made of it.
+    pub(super) fn sync_pointer_lock(&mut self, window: &Window, grabbed: bool, focused: bool) {
+        let mouse = horizon_ios_input::mouse_connected();
+        let wanted = grabbed && focused && mouse;
         if wanted != self.lock_wanted {
+            log::info!(
+                "Horizon: pointer lock wanted: {wanted} (in play {grabbed}, window focused \
+                 {focused}, mouse {mouse})"
+            );
             self.lock_wanted = wanted;
+            self.lock_asked = (Instant::now(), 0);
             horizon_ios_input::set_pointer_locked(window, wanted);
         }
         let seen = horizon_ios_input::pointer_lock_state(window);
+        // The lock is a request the system may pass over (the app was busy becoming active, a
+        // button was held): ask again until the system's state matches.
+        let (asked, tries) = self.lock_asked;
+        if seen.is_some_and(|locked| locked != wanted) && asked.elapsed() >= LOCK_RETRY && tries < 5
+        {
+            log::info!("Horizon: the pointer lock is still {seen:?}: asking again");
+            self.lock_asked = (Instant::now(), tries + 1);
+            horizon_ios_input::set_pointer_locked(window, wanted);
+        }
         if seen != self.lock_seen {
             self.lock_seen = seen;
             if let Some(locked) = seen {
@@ -240,28 +320,6 @@ impl HardwareInput {
     }
 }
 
-/// The cursor's arrow, a cell a point: `#` its outline, `o` its inside.
-const ARROW: [&str; 13] = [
-    "#       ", "##      ", "#o#     ", "#oo#    ", "#ooo#   ", "#oooo#  ", "#ooooo# ", "#oooooo#",
-    "#ooo####", "#o#oo#  ", "##  #o# ", "#   #o# ", "     ## ",
-];
-
-/// The cursor with its tip at `at` (GUI pixels); `point` is a point in GUI pixels.
-pub(super) fn draw_cursor(batch: &mut HudBatch, atlas: &HudAtlas, at: (f32, f32), point: f32) {
-    let cell = point * 1.4;
-    for (row, line) in ARROW.iter().enumerate() {
-        for (col, c) in line.bytes().enumerate() {
-            let color = match c {
-                b'#' => rgba(0, 0, 0, 255),
-                b'o' => rgba(255, 255, 255, 255),
-                _ => continue,
-            };
-            let (x, y) = (at.0 + col as f32 * cell, at.1 + row as f32 * cell);
-            batch.fill(atlas, x, y, cell, cell, color);
-        }
-    }
-}
-
 impl Game<'_> {
     /// Once a frame, before the pads: the keyboard's and mouse's input since the last frame, and
     /// the pointer lock.
@@ -269,12 +327,11 @@ impl Game<'_> {
         let Some(window) = self.window.clone() else {
             return;
         };
-        horizon_ios_input::watch_pointer_touches(&window);
+        horizon_ios_input::watch_pointer(&window);
         let id = window.id();
         for input in horizon_ios_input::poll() {
             let was_active = self.hardware.active();
-            let pointer = self.hardware_pointer(&window);
-            for out in self.hardware.translate(input, pointer, false) {
+            for out in self.hardware.translate(input, self.captured, false) {
                 self.hardware_out(event_loop, id, out);
             }
             if !was_active && self.hardware.active() {
@@ -283,27 +340,11 @@ impl Game<'_> {
                 self.pad.keyboard_took_over = true;
             }
         }
-        for out in self.hardware.frame(false) {
+        for out in self.hardware.frame(self.captured, false) {
             self.hardware_out(event_loop, id, out);
         }
-        self.hardware.sync_pointer_lock(&window, self.focused);
-    }
-
-    fn hardware_pointer(&self, window: &Window) -> Pointer {
-        let size = self.renderer.as_ref().map_or_else(
-            || horizon_client::window::surface_size(window).into(),
-            |r| [r.config.width, r.config.height],
-        );
-        let scale = f64::from(HudBatch::new(size).scale);
-        Pointer {
-            grabbed: self.captured,
-            at: (
-                f64::from(self.cursor.0) * scale,
-                f64::from(self.cursor.1) * scale,
-            ),
-            size,
-            scale_factor: window.scale_factor(),
-        }
+        self.hardware
+            .sync_pointer_lock(&window, self.captured, self.focused);
     }
 
     fn hardware_out(&mut self, event_loop: &dyn EventLoopCtl, id: WindowId, out: Out) {
@@ -311,18 +352,6 @@ impl Game<'_> {
             Out::Event(event) => self.user_window_event(event_loop, id, event),
             Out::Look(x, y) => self.mouse_motion(event_loop, x, y),
         }
-    }
-
-    pub(super) fn draw_hardware_cursor(&self, batch: &mut HudBatch) {
-        if !self.hardware.cursor_shown(self.captured) {
-            return;
-        }
-        let point = self
-            .window
-            .as_ref()
-            .map_or(1.0, |w| w.scale_factor() as f32)
-            / batch.scale;
-        draw_cursor(batch, &self.gui.atlas, self.cursor, point);
     }
 
     /// The window's keys come from GameController while a keyboard is connected: winit's own key
@@ -341,46 +370,20 @@ impl Loading {
         let Some(window) = self.window.clone() else {
             return;
         };
-        horizon_ios_input::watch_pointer_touches(&window);
+        horizon_ios_input::watch_pointer(&window);
         let id = window.id();
-        let size = self.renderer.as_ref().map_or_else(
-            || horizon_client::window::surface_size(&window).into(),
-            |r| [r.config.width, r.config.height],
-        );
-        for input in horizon_ios_input::poll() {
-            let pointer = Pointer {
-                grabbed: false,
-                at: self.menu.pointer(),
-                size,
-                scale_factor: window.scale_factor(),
-            };
-            for out in self.hardware.translate(input, pointer, true) {
-                if let Out::Event(event) = out {
-                    self.window_event(event_loop, id, event);
-                }
-            }
+        let inputs = horizon_ios_input::poll();
+        let mut outs = Vec::new();
+        for input in inputs {
+            outs.extend(self.hardware.translate(input, false, true));
         }
-        for out in self.hardware.frame(true) {
+        outs.extend(self.hardware.frame(false, true));
+        for out in outs {
             if let Out::Event(event) = out {
                 self.window_event(event_loop, id, event);
             }
         }
-        self.hardware.sync_pointer_lock(&window, true);
-    }
-
-    pub(super) fn draw_hardware_cursor(&self, batch: &mut HudBatch) {
-        if !self.hardware.cursor_shown(false) {
-            return;
-        }
-        let atlas = self.gui.as_ref().map_or(&self.boot, |gui| &gui.atlas);
-        let point = self
-            .window
-            .as_ref()
-            .map_or(1.0, |w| w.scale_factor() as f32)
-            / batch.scale;
-        let (x, y) = self.menu.pointer();
-        let at = (x as f32 / batch.scale, y as f32 / batch.scale);
-        draw_cursor(batch, atlas, at, point);
+        self.hardware.sync_pointer_lock(&window, false, true);
     }
 }
 
@@ -388,37 +391,75 @@ impl Loading {
 mod tests {
     use super::*;
 
-    fn pointer(grabbed: bool) -> Pointer {
-        Pointer {
-            grabbed,
-            at: (100.0, 100.0),
-            size: [400, 300],
-            scale_factor: 2.0,
+    fn moved_to(out: &[Out]) -> Option<(f64, f64)> {
+        out.iter().find_map(|o| match o {
+            Out::Event(WindowEvent::CursorMoved { position, .. }) => Some((position.x, position.y)),
+            _ => None,
+        })
+    }
+
+    fn clicks(out: &[Out]) -> usize {
+        out.iter()
+            .filter(|o| matches!(o, Out::Event(WindowEvent::MouseInput { .. })))
+            .count()
+    }
+
+    fn click_at(x: f64, y: f64, pressed: bool) -> Input {
+        Input::Click {
+            x,
+            y,
+            button: MouseButton::Left,
+            pressed,
         }
     }
 
+    const LEFT: Input = Input::Button {
+        button: MouseButton::Left,
+        pressed: true,
+    };
+
     #[test]
-    fn the_mouse_turns_the_view_when_grabbed_and_moves_the_cursor_otherwise() {
+    fn in_play_the_mouse_turns_the_view_and_over_screens_the_pointer_places_the_cursor() {
         let mut input = HardwareInput::default();
-        let motion = Input::Motion { dx: 3.0, dy: -4.0 };
-        input.translate(Input::Motion { dx: 50.0, dy: 0.0 }, pointer(true), false);
-        let out = input.translate(motion, pointer(true), false);
+        input.translate(Input::Motion { dx: 50.0, dy: 0.0 }, true, false);
+        let out = input.translate(Input::Motion { dx: 3.0, dy: -4.0 }, true, false);
         assert!(matches!(out[..], [Out::Look(x, y)] if x == 3.0 && y == -4.0));
-        assert!(input.active());
-        let out = input.translate(motion, pointer(false), false);
-        let [Out::Event(WindowEvent::CursorMoved { position, .. })] = &out[..] else {
-            panic!("a cursor move");
-        };
-        assert_eq!((position.x, position.y), (106.0, 92.0));
-        let far = Input::Motion {
-            dx: -1000.0,
-            dy: 1000.0,
-        };
-        let out = input.translate(far, pointer(false), false);
-        let [Out::Event(WindowEvent::CursorMoved { position, .. })] = &out[..] else {
-            panic!("a cursor move");
-        };
-        assert_eq!((position.x, position.y), (0.0, 299.0));
+        assert!(
+            input
+                .translate(Input::Pointer { x: 9.0, y: 9.0 }, true, false)
+                .is_empty()
+        );
+        let out = input.translate(Input::Motion { dx: 3.0, dy: -4.0 }, false, false);
+        assert!(
+            out.is_empty(),
+            "the system's pointer moves the cursor over screens"
+        );
+        let out = input.translate(Input::Pointer { x: 640.0, y: 360.0 }, false, false);
+        assert_eq!(moved_to(&out), Some((640.0, 360.0)));
+    }
+
+    #[test]
+    fn a_click_over_screens_moves_the_cursor_to_the_click_first() {
+        let mut input = HardwareInput::default();
+        input.translate(Input::Pointer { x: 10.0, y: 10.0 }, false, false);
+        for pressed in [true, false] {
+            let out = input.translate(click_at(500.0, 200.0, pressed), false, false);
+            assert_eq!(moved_to(&out[..1]), Some((500.0, 200.0)));
+            assert_eq!(clicks(&out[1..]), 1);
+        }
+        // GameController's button is the locked pointer's: over screens, UIKit's has the click.
+        assert_eq!(clicks(&input.translate(LEFT, false, false)), 0);
+        assert_eq!(clicks(&input.translate(LEFT, true, false)), 1);
+    }
+
+    #[test]
+    fn a_button_held_as_the_game_takes_the_pointer_is_let_go() {
+        let mut input = HardwareInput::default();
+        input.translate(click_at(5.0, 5.0, true), false, false);
+        // The press closed the screen: UIKit, which had its release, no longer reports it.
+        let out = input.translate(Input::Motion { dx: 1.0, dy: 0.0 }, true, false);
+        assert_eq!(clicks(&out), 1);
+        assert!(moved_to(&out).is_none());
     }
 
     #[test]
@@ -426,21 +467,17 @@ mod tests {
         let mut input = HardwareInput::default();
         let nudge = Input::Motion { dx: 6.0, dy: 5.0 };
         for _ in 0..3 {
-            assert!(input.translate(nudge, pointer(true), false).is_empty());
+            assert!(input.translate(nudge, true, false).is_empty());
         }
         assert!(!input.active());
-        assert_eq!(input.translate(nudge, pointer(true), false).len(), 1);
+        assert_eq!(input.translate(nudge, true, false).len(), 1);
         assert!(input.active());
     }
 
     #[test]
     fn a_touch_hands_back_to_the_touch_controls() {
         let mut input = HardwareInput::default();
-        let click = Input::Button {
-            button: winit::event::MouseButton::Left,
-            pressed: true,
-        };
-        input.translate(click, pointer(false), false);
+        input.translate(click_at(1.0, 1.0, true), false, false);
         assert!(input.active());
         input.touched();
         assert!(!input.active());

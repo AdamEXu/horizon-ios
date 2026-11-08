@@ -178,17 +178,10 @@ pub(super) fn as_mouse(touch: Touch) -> Vec<WindowEvent> {
 }
 
 /// A touch the pointer of a connected mouse made (a click, a trackpad press): the mouse's own
-/// input (game/hardware_input.rs) has it already.
+/// input (game/hardware_input.rs) has its buttons and place already.
 pub(super) fn is_pointer(touch: &Touch) -> bool {
     let ended = matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled);
     horizon_ios_input::pointer_touch(touch.id, ended) && horizon_ios_input::mouse_connected()
-}
-
-pub(super) fn pointer_at(touch: &Touch) -> WindowEvent {
-    WindowEvent::CursorMoved {
-        device_id: DeviceId::dummy(),
-        position: touch.location,
-    }
 }
 
 fn inside(p: [f32; 2], r: [f32; 3]) -> bool {
@@ -253,8 +246,6 @@ impl Game<'_> {
         touch: Touch,
     ) {
         if is_pointer(&touch) {
-            // The system's pointer is showing (unlocked): the game's cursor goes where it is.
-            self.user_window_event(event_loop, id, pointer_at(&touch));
             return;
         }
         if touch.phase == TouchPhase::Started {

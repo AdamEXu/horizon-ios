@@ -9,7 +9,7 @@ pub use hid::{key_code, named_key, us_char};
 #[cfg(target_os = "ios")]
 pub use ios::{
     key_event, keyboard_connected, mouse_connected, pointer_lock_state, pointer_touch, poll,
-    set_pointer_locked, watch_pointer_touches,
+    set_pointer_locked, watch_pointer,
 };
 use winit::event::MouseButton;
 
@@ -17,24 +17,27 @@ use winit::event::MouseButton;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {
     /// A key by its HID usage (keyboard page), the number `GCKeyCode` gives it.
-    Key {
-        usage: u16,
-        pressed: bool,
-    },
-    /// The mouse moved, in GameController's units, y down.
-    Motion {
-        dx: f64,
-        dy: f64,
-    },
-    Button {
+    Key { usage: u16, pressed: bool },
+    /// The mouse moved, in GameController's units, y down: whether or not the pointer is locked.
+    Motion { dx: f64, dy: f64 },
+    /// GameController's button, whether or not the pointer is locked.
+    Button { button: MouseButton, pressed: bool },
+    /// GameController's wheel, in lines, in winit's `LineDelta` directions.
+    Wheel { dx: f64, dy: f64 },
+    /// Where the system's pointer is, in window pixels, while it isn't locked: hovering, or
+    /// dragging with a button held.
+    Pointer { x: f64, y: f64 },
+    /// A button of the system's pointer pressed or let go, while it isn't locked, where the
+    /// pointer is then (UIKit's pointer touch and its event's `buttonMask`).
+    Click {
+        x: f64,
+        y: f64,
         button: MouseButton,
         pressed: bool,
     },
-    /// The wheel or a two-finger scroll, in lines, in winit's `LineDelta` directions.
-    Scroll {
-        dx: f64,
-        dy: f64,
-    },
+    /// UIKit's scrolling (the wheel, two fingers on a trackpad) while the pointer isn't locked, in
+    /// window pixels, in winit's `PixelDelta` directions and the system's scroll direction.
+    Scroll { dx: f64, dy: f64 },
 }
 
 #[cfg(not(target_os = "ios"))]
@@ -55,7 +58,7 @@ mod other {
     pub fn pointer_lock_state(_: &Window) -> Option<bool> {
         None
     }
-    pub fn watch_pointer_touches(_: &Window) {}
+    pub fn watch_pointer(_: &Window) {}
     pub fn pointer_touch(_: u64, _: bool) -> bool {
         false
     }

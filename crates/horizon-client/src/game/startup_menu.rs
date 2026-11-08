@@ -144,11 +144,6 @@ impl StartupMenu {
         }
     }
 
-    /// The pointer, in window pixels.
-    pub(super) fn pointer(&self) -> (f64, f64) {
-        self.pointer
-    }
-
     /// After a frame is drawn: its widgets become the last frame's, and the
     /// open screen's narration reads them (`Gui.update`'s
     /// `handleDelayedNarration`). `gui` is the GUI size.

@@ -7616,7 +7616,6 @@ impl Game<'_> {
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_cursor(&mut batch);
         self.draw_touch_controls(&mut batch);
-        self.draw_hardware_cursor(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
