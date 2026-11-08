@@ -6,6 +6,25 @@ pub fn main() {
     main_with(Default::default());
 }
 
+/// The command line given in-process, for platforms that start the game without one (iOS):
+/// `args()` returns it in place of the process's arguments.
+static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The game's arguments, without the program name: those given to [`main_with_args`], else the
+/// process's.
+pub fn args() -> Vec<String> {
+    match ARGS.get() {
+        Some(args) => args.clone(),
+        None => std::env::args().skip(1).collect(),
+    }
+}
+
+/// Start the game with this command line (without the program name) instead of the process's.
+pub fn main_with_args(args: Vec<String>) {
+    let _ = ARGS.set(args);
+    main_with(Default::default());
+}
+
 /// Start the game with trait mods in dispatch order.
 pub fn main_with(mods: crate::mod_api::Mods) {
     // First: a trait injection into anything below (logging, the crash handler) calls its mod.
@@ -21,7 +40,7 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     horizon_client::telemetry::mark_start();
     horizon_client::spans::startup::init(std::time::Instant::now());
     horizon_client::spans::trace::start_from_env();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = args();
     let game_args = args.iter().take_while(|a| *a != "--dedicated");
     let help = game_args
         .clone()

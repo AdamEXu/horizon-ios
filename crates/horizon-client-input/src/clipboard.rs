@@ -5,6 +5,28 @@
 
 use winit::keyboard::{Key, KeyCode, PhysicalKey};
 
+/// iOS has no arboard backend: the clipboard stays in the game (UIPasteboard later).
+#[cfg(target_os = "ios")]
+mod arboard {
+    #[allow(dead_code)]
+    pub enum Error {
+        ContentNotAvailable,
+        Unknown,
+    }
+    pub struct Clipboard;
+    impl Clipboard {
+        pub fn new() -> Result<Self, Error> {
+            Err(Error::ContentNotAvailable)
+        }
+        pub fn get_text(&mut self) -> Result<String, Error> {
+            Err(Error::ContentNotAvailable)
+        }
+        pub fn set_text(&mut self, _text: String) -> Result<(), Error> {
+            Err(Error::ContentNotAvailable)
+        }
+    }
+}
+
 /// A text-editing shortcut (`InputWithModifiers.isSelectAll`, `isCopy`,
 /// `isPaste`, `isCut`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

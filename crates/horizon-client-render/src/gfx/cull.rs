@@ -235,7 +235,8 @@ impl Cull {
             .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
             && adapter.get_downlevel_capabilities().flags.contains(
                 wgpu::DownlevelFlags::VERTEX_STORAGE
-                    | wgpu::DownlevelFlags::FRAGMENT_WRITABLE_STORAGE,
+                    | wgpu::DownlevelFlags::FRAGMENT_WRITABLE_STORAGE
+                    | wgpu::DownlevelFlags::INDIRECT_EXECUTION,
             ))
         .then_some(depth_test)
     }

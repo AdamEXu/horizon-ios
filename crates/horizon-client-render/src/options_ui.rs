@@ -7601,7 +7601,7 @@ mod tests {
                     o => format!("{o:?}"),
                 };
                 // macOS has one graphics API: the graphics screen leaves the row out.
-                if id == "graphics-api" && cfg!(target_os = "macos") {
+                if id == "graphics-api" && cfg!(target_vendor = "apple") {
                     continue;
                 }
                 assert!(

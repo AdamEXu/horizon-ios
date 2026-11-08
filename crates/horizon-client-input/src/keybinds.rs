@@ -298,6 +298,9 @@ pub use horizon_client_core::key_display::display_name;
 /// A key event: what the layout writes on its key, without modifiers, names
 /// that key from now on (`key_display::learn_layout`), so an AZERTY player's
 /// Q key shows A.
+#[cfg(target_os = "ios")]
+pub fn learn_layout(_event: &winit::event::KeyEvent) {}
+#[cfg(not(target_os = "ios"))]
 pub fn learn_layout(event: &winit::event::KeyEvent) {
     use winit::keyboard::{Key, PhysicalKey};
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;

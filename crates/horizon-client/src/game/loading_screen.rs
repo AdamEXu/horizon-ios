@@ -108,12 +108,12 @@ impl Loading {
         );
         // `--offscreen` renders into a texture: its window would only show white.
         let window_step = startup::step("window.create");
-        let window = match event_loop.create_window(
+        let window = match event_loop.create_window(horizon_client::window::for_platform(
             attributes
                 .with_inner_size(winit::dpi::LogicalSize::new(size[0], size[1]))
                 .with_fullscreen(fullscreen.then_some(winit::window::Fullscreen::Borderless(None)))
                 .with_visible(!self.options.as_ref().is_some_and(|o| o.offscreen)),
-        ) {
+        )) {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 self.error = Some(e.into());
@@ -398,8 +398,33 @@ impl ApplicationHandler for App {
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // iOS: the surface fills the screen, not only the safe area winit reports.
+        #[cfg(target_os = "ios")]
+        let event = match event {
+            WindowEvent::Resized(_) => {
+                let window = match self {
+                    App::Loading(loading) => loading.window.clone(),
+                    App::Ready(split) => split.host.window.clone(),
+                };
+                match window {
+                    Some(window) => {
+                        WindowEvent::Resized(horizon_client::window::surface_size(&window))
+                    }
+                    None => event,
+                }
+            }
+            event => event,
+        };
         match self {
-            App::Loading(loading) => loading.window_event(event_loop, id, event),
+            // The startup menu takes a touch as the mouse.
+            App::Loading(loading) => match event {
+                WindowEvent::Touch(touch) => {
+                    for event in super::touch::as_mouse(touch) {
+                        loading.window_event(event_loop, id, event);
+                    }
+                }
+                event => loading.window_event(event_loop, id, event),
+            },
             App::Ready(game) => game.window_event(event_loop, id, event),
         }
     }

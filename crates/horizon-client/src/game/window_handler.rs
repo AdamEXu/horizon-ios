@@ -157,6 +157,7 @@ impl Game<'_> {
         if self.pending_save.is_some() {
             return;
         }
+        self.touch_frame();
         horizon_client::spans::time("pads", || self.poll_pads(event_loop));
         self.pause_if_inactive();
         if self.options.frames.is_some() && self.started.elapsed() > self.options.timeout {
@@ -218,12 +219,12 @@ impl ApplicationHandler for Game<'_> {
         );
         // `--offscreen` renders into a texture: its window would only show white.
         let window_step = startup::step("window.create");
-        let window = match event_loop.create_window(
+        let window = match event_loop.create_window(horizon_client::window::for_platform(
             attributes
                 .with_inner_size(winit::dpi::LogicalSize::new(size[0], size[1]))
                 .with_fullscreen(fullscreen.then_some(winit::window::Fullscreen::Borderless(None)))
                 .with_visible(!self.options.offscreen),
-        ) {
+        )) {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 self.error = Some(e.into());
@@ -252,6 +253,10 @@ impl ApplicationHandler for Game<'_> {
         self.previous = Instant::now();
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let WindowEvent::Touch(touch) = event {
+            self.touch_event(event_loop, id, touch);
+            return;
+        }
         let key = if self.window.as_ref().is_some_and(|w| w.id() == id)
             && let WindowEvent::KeyboardInput {
                 event,

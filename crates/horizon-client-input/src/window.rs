@@ -998,3 +998,36 @@ mod tests {
         assert_eq!(listings, 3);
     }
 }
+
+/// The attributes a window is created with, fitted to the platform: on iOS the window is the
+/// screen, so a desktop size (or fullscreen) would only leave its surface larger than the view.
+pub fn for_platform(
+    attributes: winit::window::WindowAttributes,
+) -> winit::window::WindowAttributes {
+    #[cfg(target_os = "ios")]
+    {
+        use winit::platform::ios::{ScreenEdge, ValidOrientations, WindowAttributesExtIOS};
+        let mut attributes = attributes;
+        attributes.inner_size = None;
+        attributes.fullscreen = None;
+        // The game's controls sit at the screen's edges: touches there are the game's first,
+        // as in other games (a second swipe still reaches the system).
+        attributes
+            .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
+            .with_prefers_home_indicator_hidden(true)
+            .with_prefers_status_bar_hidden(true)
+            .with_valid_orientations(ValidOrientations::Landscape)
+    }
+    #[cfg(not(target_os = "ios"))]
+    attributes
+}
+
+/// The size the window's surface is drawn at. On iOS winit's inner size is the safe area, but
+/// the view (and its Metal layer) fills the screen, so the surface takes the whole screen.
+pub fn surface_size(window: &winit::window::Window) -> winit::dpi::PhysicalSize<u32> {
+    if cfg!(target_os = "ios") {
+        window.outer_size()
+    } else {
+        window.inner_size()
+    }
+}

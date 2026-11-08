@@ -205,6 +205,10 @@ impl Pads {
         edges
     }
 
+    /// The virtual pad's state, for the touch controls (game/touch.rs).
+    pub(super) fn injected_mut(&mut self) -> &mut PadState {
+        &mut self.injected
+    }
     /// A replay's pad button, in place of `pad`'s line.
     pub(super) fn inject_button(&mut self, button: Button, down: bool) {
         self.injected.set(button, down);

@@ -184,7 +184,9 @@ impl Game<'_> {
         };
         let scale = HudBatch::new(size).scale;
         let was_grabbed = self.captured;
-        if self.options.offscreen && !self.split_window {
+        // iOS has no pointer to grab: touch turns the view (game/touch.rs), so the grab is
+        // the game's own state, as offscreen.
+        if (self.options.offscreen && !self.split_window) || cfg!(target_os = "ios") {
             // A genuinely hidden `--offscreen` run leaves the system pointer where
             // the person at the computer has it. Its grab is internal (an
             // agent turns the view with `mouse-move`).

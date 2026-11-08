@@ -44,7 +44,9 @@ impl Game<'_> {
 
     /// Allow the input method only while a text box has focus.
     pub(super) fn sync_ime(&mut self) {
-        let want = self.text_field_focused();
+        let focused = self.text_field_focused();
+        // A touch screen's keyboard covers half the screen: only when the field is tapped.
+        let want = focused && self.touch_keyboard_wanted(focused);
         if want != self.ime_allowed
             && let Some(window) = &self.window
         {
@@ -83,6 +85,7 @@ impl Game<'_> {
         let width = (((x1 - x0) * scale).round() as i32).max(1);
         let height = (((y1 - y0) * scale).round() as i32).max(1);
         let area = [x, y, width, height];
+        self.touch_text_area(area);
         if self.ime_area == Some(area) {
             return;
         }
@@ -100,6 +103,10 @@ impl Game<'_> {
     /// Text the input method committed (`WindowEvent::Ime(Commit)`).
     pub(super) fn ime_commit(&mut self, text: &str) {
         preedit::set_preedit(None);
+        // Return on a touch screen's keyboard puts it away.
+        if text.contains(['\n', '\r']) {
+            self.touch_keyboard_done();
+        }
         // Dialogs have their own fields; the other topmost prompts take no text.
         if self.prompt_open() && !self.dialog_open() {
             return;

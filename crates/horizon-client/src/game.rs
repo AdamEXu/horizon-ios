@@ -329,6 +329,7 @@ mod options;
 mod ordered_tick;
 mod packs;
 mod pad;
+// Touch screens (iOS): a stick, view turning and buttons over play; taps as the mouse in menus.
 mod pad_actions;
 mod pad_menu;
 mod paintings;
@@ -429,6 +430,7 @@ mod tick_script;
 mod titles;
 mod tnt;
 mod totem;
+mod touch;
 mod trading;
 mod transient_blocks;
 mod trial_spawner;
@@ -675,7 +677,7 @@ impl Options {
     /// The command line, then what it asks of the process: the game folder, the account.
     /// A bad command line is a [`launch_api::UsageError`] (exit code 2, no crash report).
     fn read() -> Result<Option<Self>> {
-        let Some(mut o) = Self::parse(std::env::args().skip(1))
+        let Some(mut o) = Self::parse(crate::entry::args().into_iter())
             .map_err(|e| launch_api::UsageError(e.to_string()))?
         else {
             return Ok(None);
@@ -2519,6 +2521,8 @@ struct Game<'a> {
     last_input: Instant,
     /// Controllers (Horizon's own).
     pad: pad::Pads,
+    /// The touch screen's controls (game/touch.rs).
+    touch: touch::TouchControls,
     frames: u64,
     /// The glint clock and options, read once at the start of each frame
     /// (game/item_draw.rs).
@@ -7608,6 +7612,7 @@ impl Game<'_> {
         self.frame_graph
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_cursor(&mut batch);
+        self.draw_touch_controls(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
@@ -16225,6 +16230,7 @@ impl<'a> Game<'a> {
             frame_end: now,
             last_input: now,
             pad: Default::default(),
+            touch: Default::default(),
             frames: 0,
             glint_frame: Default::default(),
             kept_block_entities: Default::default(),
