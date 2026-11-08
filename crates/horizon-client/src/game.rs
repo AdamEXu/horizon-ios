@@ -167,6 +167,7 @@ mod glowing;
 mod golems;
 mod growth;
 mod hand;
+mod hardware_input;
 mod headless;
 mod hud_editor;
 mod ime;
@@ -2523,6 +2524,8 @@ struct Game<'a> {
     pad: pad::Pads,
     /// The touch screen's controls (game/touch.rs).
     touch: touch::TouchControls,
+    /// A hardware keyboard and mouse on iPadOS (game/hardware_input.rs).
+    hardware: hardware_input::HardwareInput,
     frames: u64,
     /// The glint clock and options, read once at the start of each frame
     /// (game/item_draw.rs).
@@ -7613,6 +7616,7 @@ impl Game<'_> {
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_cursor(&mut batch);
         self.draw_touch_controls(&mut batch);
+        self.draw_hardware_cursor(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
@@ -16231,6 +16235,7 @@ impl<'a> Game<'a> {
             last_input: now,
             pad: Default::default(),
             touch: Default::default(),
+            hardware: Default::default(),
             frames: 0,
             glint_frame: Default::default(),
             kept_block_entities: Default::default(),
@@ -17066,6 +17071,7 @@ fn run_loading(
         ui_at: None,
         title_drawn: false,
         menu,
+        hardware: Default::default(),
         error: None,
     };
     let mut app = App::Loading(Box::new(loading));

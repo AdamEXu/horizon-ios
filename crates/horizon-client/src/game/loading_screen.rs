@@ -71,6 +71,8 @@ pub(super) struct Loading {
     pub(super) ui_at: Option<Instant>,
     pub(super) title_drawn: bool,
     pub(super) menu: startup_menu::StartupMenu,
+    /// A hardware keyboard and mouse (iPadOS), handed to the game with the window.
+    pub(super) hardware: hardware_input::HardwareInput,
     pub(super) error: Option<Box<dyn std::error::Error>>,
 }
 /// How long the handoff waits for the first title frame before building the
@@ -248,6 +250,7 @@ impl Loading {
             return;
         }
         self.poll_menu_realms(event_loop);
+        self.hardware_input(event_loop);
         if let Some(w) = &self.window {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
                 self.draw();
@@ -267,6 +270,7 @@ impl Loading {
         };
         let mut batch = HudBatch::new(size);
         self.draw_menu(&mut batch);
+        self.draw_hardware_cursor(&mut batch);
         self.menu.frame_drawn((batch.width, batch.height));
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(
@@ -365,6 +369,7 @@ impl Loading {
         game.world_renderer_ready = true;
         game.fullscreen = self.fullscreen;
         game.panorama_rotation = self.panorama_rotation;
+        game.hardware = std::mem::take(&mut self.hardware);
         self.menu.handoff(&mut game);
         game.apply_settings();
         game.previous = Instant::now();
@@ -416,13 +421,21 @@ impl ApplicationHandler for App {
             event => event,
         };
         match self {
-            // The startup menu takes a touch as the mouse.
+            // The startup menu takes a finger as the mouse.
             App::Loading(loading) => match event {
                 WindowEvent::Touch(touch) => {
+                    if super::touch::is_pointer(&touch) {
+                        loading.window_event(event_loop, id, super::touch::pointer_at(&touch));
+                        return;
+                    }
+                    if touch.phase == winit::event::TouchPhase::Started {
+                        loading.hardware.touched();
+                    }
                     for event in super::touch::as_mouse(touch) {
                         loading.window_event(event_loop, id, event);
                     }
                 }
+                event if Game::hardware_drops(&event) => {}
                 event => loading.window_event(event_loop, id, event),
             },
             App::Ready(game) => game.window_event(event_loop, id, event),

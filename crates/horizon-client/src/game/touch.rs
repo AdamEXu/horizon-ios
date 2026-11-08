@@ -177,6 +177,20 @@ pub(super) fn as_mouse(touch: Touch) -> Vec<WindowEvent> {
     }
 }
 
+/// A touch the pointer of a connected mouse made (a click, a trackpad press): the mouse's own
+/// input (game/hardware_input.rs) has it already.
+pub(super) fn is_pointer(touch: &Touch) -> bool {
+    let ended = matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled);
+    horizon_ios_input::pointer_touch(touch.id, ended) && horizon_ios_input::mouse_connected()
+}
+
+pub(super) fn pointer_at(touch: &Touch) -> WindowEvent {
+    WindowEvent::CursorMoved {
+        device_id: DeviceId::dummy(),
+        position: touch.location,
+    }
+}
+
 fn inside(p: [f32; 2], r: [f32; 3]) -> bool {
     // A little larger than drawn: fingers are wide.
     let pad = 3.0;
@@ -238,6 +252,14 @@ impl Game<'_> {
         id: WindowId,
         touch: Touch,
     ) {
+        if is_pointer(&touch) {
+            // The system's pointer is showing (unlocked): the game's cursor goes where it is.
+            self.user_window_event(event_loop, id, pointer_at(&touch));
+            return;
+        }
+        if touch.phase == TouchPhase::Started {
+            self.hardware.touched();
+        }
         self.touch.seen = true;
         self.last_input = Instant::now();
         let scale = self.touch_scale();
@@ -419,7 +441,9 @@ impl Game<'_> {
             self.touch.keyboard = false;
             self.touch.text_area = None;
         }
-        !cfg!(target_os = "ios") || self.touch.keyboard
+        // A hardware keyboard leaves the screen free: UIKit shows no keyboard, and the field
+        // needs its text input.
+        !cfg!(target_os = "ios") || self.touch.keyboard || horizon_ios_input::keyboard_connected()
     }
 
     pub(super) fn touch_keyboard_done(&mut self) {
@@ -467,7 +491,7 @@ impl Game<'_> {
 
     /// The controls over play, once the touch screen is in use (always on iOS).
     pub(super) fn draw_touch_controls(&self, batch: &mut HudBatch) {
-        if !(self.touch.seen || cfg!(target_os = "ios")) {
+        if !(self.touch.seen || cfg!(target_os = "ios")) || self.hardware.active() {
             return;
         }
         let atlas = &self.gui.atlas;
