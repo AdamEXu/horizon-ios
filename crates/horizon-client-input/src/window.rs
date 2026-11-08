@@ -1016,7 +1016,7 @@ pub fn for_platform(
             .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
             .with_prefers_home_indicator_hidden(true)
             .with_prefers_status_bar_hidden(true)
-            .with_valid_orientations(ValidOrientations::Landscape)
+            .with_valid_orientations(ValidOrientations::LandscapeAndPortrait)
     }
     #[cfg(not(target_os = "ios"))]
     attributes
@@ -1030,4 +1030,94 @@ pub fn surface_size(window: &winit::window::Window) -> winit::dpi::PhysicalSize<
     } else {
         window.inner_size()
     }
+}
+
+/// The fold of a foldable display (iPhone Duo) across the window, in window pixels: from
+/// `start` to `end` along the window's height when `horizontal` (the device held upright,
+/// top and bottom halves), else along its width. `start == end` while the device lies flat.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Division {
+    pub horizontal: bool,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// What the platform says about a window's display, for layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DisplayShape {
+    /// The display's fold, when it has one.
+    pub division: Option<Division>,
+    /// Upright is a layout the app offers here (a foldable or a tablet), not only landscape.
+    pub portrait: bool,
+}
+
+/// Asks the platform about a window's display (installed by the iOS app, which may call UIKit).
+pub type DisplayShapeQuery = fn(&winit::window::Window) -> DisplayShape;
+static DISPLAY_SHAPE: std::sync::OnceLock<DisplayShapeQuery> = std::sync::OnceLock::new();
+/// Development: lay out a horizontal fold at mid-height where the display has none
+/// (`--deck`), since the iOS Simulator does not turn iPhone Duo's inner display upright.
+pub static FORCE_DIVISION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Installs the platform's display query; the first one stays.
+pub fn install_display_shape(query: DisplayShapeQuery) {
+    let _ = DISPLAY_SHAPE.set(query);
+}
+
+/// The window's display: its fold and the orientations that suit it. Asked again on every
+/// resize, never kept: folding, rotating and moving between displays change it.
+pub fn display_shape(window: &winit::window::Window) -> DisplayShape {
+    let mut shape = DISPLAY_SHAPE.get().map(|q| q(window)).unwrap_or_default();
+    if FORCE_DIVISION.load(std::sync::atomic::Ordering::Relaxed)
+        && !shape.division.is_some_and(|d| d.horizontal)
+    {
+        let mid = f64::from(surface_size(window).height) / 2.0;
+        shape.division = Some(Division {
+            horizontal: true,
+            start: mid,
+            end: mid,
+        });
+    }
+    shape
+}
+
+/// Lets the window turn upright where that suits the display, else keeps it landscape.
+pub fn fit_orientations(window: &winit::window::Window, shape: DisplayShape) {
+    #[cfg(target_os = "ios")]
+    {
+        use winit::platform::ios::{ValidOrientations, WindowExtIOS};
+        window.set_valid_orientations(if shape.portrait {
+            ValidOrientations::LandscapeAndPortrait
+        } else {
+            ValidOrientations::Landscape
+        });
+    }
+    #[cfg(not(target_os = "ios"))]
+    let _ = (window, shape);
+}
+
+/// A native page view over part of the window (iPhone Duo's deck: a SwiftUI pager): the
+/// platform's paging, titles and page dots, over page content the game draws.
+#[derive(Clone, Copy)]
+pub struct PagerHost {
+    /// Shows the pager over `rect` of the window (window pixels) with these page titles, or
+    /// hides it.
+    pub update: fn(&winit::window::Window, Option<[f64; 4]>, &[String]),
+    /// The pager's position in pages (1.5: halfway between the second and the third).
+    pub offset: fn() -> f64,
+    /// The bands its title and dots take over the pages, top and bottom, in points.
+    pub bands: fn() -> (f64, f64),
+    /// The oldest tap on a page not yet taken: the page and where on it, in points.
+    pub next_tap: fn() -> Option<(usize, f64, f64)>,
+}
+static PAGER: std::sync::OnceLock<PagerHost> = std::sync::OnceLock::new();
+
+/// Installs the platform's page view; the first one stays.
+pub fn install_pager(host: PagerHost) {
+    let _ = PAGER.set(host);
+}
+
+/// The platform's page view, where it has one.
+pub fn pager() -> Option<&'static PagerHost> {
+    PAGER.get()
 }

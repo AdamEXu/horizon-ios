@@ -163,6 +163,8 @@ pub mod capture;
 pub mod compositor;
 pub(crate) mod core_lines;
 mod cull;
+/// iPhone Duo upright: the game above the fold, the control deck below.
+pub mod deck;
 mod end_sky;
 pub mod entity_skin;
 mod flat;
@@ -1078,6 +1080,9 @@ pub struct Renderer {
     spare_surface: std::sync::Mutex<Option<wgpu::Surface<'static>>>,
     /// The offscreen colour target, sized like `config`.
     offscreen: Option<wgpu::Texture>,
+    /// iPhone Duo upright: the deck presents the window, this renderer draws offscreen
+    /// (`gfx/deck.rs`).
+    deck: Option<deck::DeckPresenter>,
     /// Offscreen submissions still on the GPU: at most two frames run ahead.
     in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
     /// Splitscreen: the caller waits for the GPU once every player has submitted
@@ -4698,6 +4703,7 @@ impl Renderer {
             surface: surface.map(Arc::new),
             spare_surface: std::sync::Mutex::new(None),
             offscreen,
+            deck: None,
             in_flight: std::collections::VecDeque::new(),
             paced_elsewhere: false,
             first_frame: if previous.is_none() {
@@ -5075,7 +5081,8 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: config.format,
-            usage: config.usage,
+            // TEXTURE_BINDING: the deck samples the game's frame (`gfx/deck.rs`).
+            usage: config.usage | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &config.view_formats,
         })
     }

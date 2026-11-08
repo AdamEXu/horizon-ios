@@ -15,6 +15,14 @@ path = "src/main.rs"
 horizon-client = { path = "../horizon-client", default-features = false, features = ["audio"] }
 horizon-threads = { path = "../horizon-threads" }
 horizon-mods = { path = "../horizon-mods", default-features = false, features = ["index"] }
+horizon-client-input = { path = "../horizon-client-input" }
+winit = "0.30.13"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# UIKit's reserved regions (iPhone Duo's fold) and the device idiom, by message: the versions
+# winit already uses.
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
 
 [lints]
 workspace = true

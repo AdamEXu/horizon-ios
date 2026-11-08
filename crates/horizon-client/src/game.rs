@@ -431,6 +431,8 @@ mod titles;
 mod tnt;
 mod totem;
 mod touch;
+// iPhone Duo upright: the control deck below the fold (game/deck.rs).
+mod deck;
 mod trading;
 mod transient_blocks;
 mod trial_spawner;
@@ -2523,6 +2525,8 @@ struct Game<'a> {
     pad: pad::Pads,
     /// The touch screen's controls (game/touch.rs).
     touch: touch::TouchControls,
+    /// iPhone Duo upright: the control deck below the fold (game/deck.rs).
+    deck: deck::Deck,
     frames: u64,
     /// The glint clock and options, read once at the start of each frame
     /// (game/item_draw.rs).
@@ -3484,7 +3488,12 @@ impl Game<'_> {
                 pick_view_vector(m.head_yaw, m.head_pitch),
             ));
         }
-        Some((self.eye_position()?, pick_view_vector(self.yaw, self.pitch)))
+        let eye = self.eye_position()?;
+        // A touch screen aims where the finger is (game/touch.rs).
+        if let Some(dir) = self.touch_aim(self.yaw, self.pitch) {
+            return Some((eye, dir));
+        }
+        Some((eye, pick_view_vector(self.yaw, self.pitch)))
     }
     /// `Player.blockInteractionRange`: the block pick's and mining's reach.
     fn reach(&self) -> f64 {
@@ -7726,6 +7735,8 @@ impl Game<'_> {
             if self.camera_type.first_person()
                 && (!spectator || self.spectator_crosshair())
                 && !self.debug_crosshair()
+                // Touch controls aim where the finger is, as the Pocket Edition did.
+                && !self.touch_controls()
             {
                 let attack = (indicator == 1).then_some(strength);
                 let full = attack.is_some_and(|a| {
@@ -13385,7 +13396,12 @@ impl Game<'_> {
         if self.screenshot_sequence.is_some() {
             return self.render_sequence_frame();
         }
-        self.render_frame()
+        let drawn = self.render_frame()?;
+        // iPhone Duo upright: the deck below the fold, with the frame just drawn above it.
+        if drawn {
+            self.present_deck()?;
+        }
+        Ok(drawn)
     }
     fn render_frame(&mut self) -> Result<bool> {
         let prepare = spans::guard("prepare");
@@ -13765,6 +13781,7 @@ impl Game<'_> {
         } else {
             self.fov_degrees(camera_alpha as f32, camera.to_array())
         };
+        self.touch.fov = fov_degrees;
         let bob = if title {
             glam::Mat4::IDENTITY
         } else {
@@ -16231,6 +16248,7 @@ impl<'a> Game<'a> {
             last_input: now,
             pad: Default::default(),
             touch: Default::default(),
+            deck: Default::default(),
             frames: 0,
             glint_frame: Default::default(),
             kept_block_entities: Default::default(),

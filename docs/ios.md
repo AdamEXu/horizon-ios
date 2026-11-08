@@ -43,24 +43,70 @@ Extra arguments for development go after the bundle id:
 
 ## Touch controls
 
-`crates/horizon-client/src/game/touch.rs`. In play:
+`crates/horizon-client/src/game/touch.rs`: gestures in the manner of the classic Pocket Edition,
+with no buttons, no stick drawn, no crosshair and no controller hints: nothing shows for the
+controls, even while touching. Actions aim where the finger is.
 
-| Where | What |
-|---|---|
-| Left 40% of the screen (below the top quarter) | A floating stick: walk |
-| Anywhere else, drag | Turn the view |
-| Anywhere else, quick tap | Use / place (the use trigger) |
-| Anywhere else, press and hold still | Mine / attack (the attack trigger) |
-| `^` `v` `>>` | Jump, sneak, sprint (held) |
-| `X` `O` | Attack, use (held) |
-| `…` `@` `‖` (right edge) | Inventory, camera, pause |
-| The hotbar | Select that slot |
+Where the gestures go:
 
-The buttons press the virtual pad's buttons (the one `horizon-ctl pad` drives), so they do what
-the controller bindings say and the game shows controller hints. In menus and the inventory a
-finger is the mouse (down presses, moving drags, up releases), two fingers scroll, and `<` at the
-top left closes a screen opened in play (the pad's B). The system keyboard comes up when a text
-field is tapped and goes away on Return or a tap elsewhere.
+- **iPad, and iPhone Duo open flat or closed**: the thumb walks from the lower left corner of the
+  game's view (its left third, lower 60%); everywhere else looks and acts.
+- **iPhone Duo upright**: the deck's left side walks, its right side acts (tap, swipes up and
+  down, swipes across to look, hold, double tap), and the game's whole view above the fold looks and acts.
+
+| Gesture | On the walking area | On the look/act area |
+|---|---|---|
+| Drag | Walk (a floating stick); to its edge, sprint | Across: turn the view, then every way |
+| Tap | | Inventory (after the double tap's window) |
+| Swipe down | | Crouch until the finger lifts |
+| Swipe up | | Jump until the finger lifts (swims and flies up while held) |
+| Hold still | | Mine or attack under the finger (the view's centre from the deck) |
+| Double tap | | Use or place at the finger (the view's centre from the deck) |
+| Double tap with a finger on each | Pause | Pause |
+
+The hotbar takes taps to select a slot.
+
+Distances are in points, so they feel the same whatever the GUI scale: a tap moves under 10 pt,
+a hold stays within the same 10 pt. Past 10 pt a finger is decided by its direction: more vertical than
+across is a swipe, acting at 28 pt (up jumps, down crouches); more across is a look, which turns
+the view from there on, never by the way it came, so the view never jumps.
+
+The gestures press the virtual pad's buttons (the one `horizon-ctl pad` drives), so they do what
+the controller bindings say; touch alone never marks the controller in use, so no glyphs show. The pick aims through the finger's point (`touch_aim`, used by
+`aim()`). In menus a finger is the mouse (down presses, moving drags, up releases) and two
+fingers scroll; **a tap outside a menu opened in play closes it** (outside a container's panel,
+`hasClickedOutside`, with nothing carried; or on no widget of another screen; screens that type
+are left alone). The system keyboard comes up when a text field is tapped and goes away on
+Return or a tap elsewhere.
+
+## iPhone Duo upright: the page view
+
+`crates/horizon-client/src/game/deck.rs`, `crates/horizon-client-render/src/gfx/deck.rs` and
+`crates/horizon-ios/swift/DeckPages.swift`. When the window has a horizontal fold (UIKit's
+`reservedRegionsOfKind:` with the division kind, asked on every resize through
+`window::display_shape`), the game takes the screen above the fold and the deck the one below: the controls' two pads at
+its sides and, pressed into the metal between them with padding, a card holding the page view:
+
+- **The pages are SwiftUI**: a paging `ScrollView` in a `UIHostingController` over the deck
+  (`window::PagerHost`, implemented in `crates/horizon-ios/src/pager.rs`), with the page's
+  title and its dots on Liquid-Glass-like material. It owns the paging, its physics and taps; it
+  reports its offset (`onScrollGeometryChange`, iOS 18) and a queue of taps.
+- **The pages' content is the game's**, drawn under the pager at its offset so it slides with it:
+  the **inventory** (tap the hotbar row to select a slot), a **map** (the minimap's tiles, turning
+  with the player), the **player** as they are now (the inventory's 3D preview) and their
+  **status** (health, food, level, position, biome, day and time). SwiftUI can't draw Minecraft
+  items or models, hence the split.
+- **The reflection**: the renderer draws offscreen at the size of the top part; `DeckPresenter`
+  composes each frame: the game above the fold, then brushed graphite reflecting it as metal does
+  (the frame in a 256x128 mipmapped probe, mirrored across the fold, nearly sharp at the fold and
+  blurring steadily with distance, smeared along the reflection more than across it, mostly grey
+  with a little of the scene's hue, fading down the deck), then the recessed card (darker, shadowed
+  under its top edge, a lit lip below) with the page content clipped to it.
+- Folding closed hides the pager and gives the game the whole screen; opening brings it back.
+
+`build.rs` compiles `swift/` with `swiftc` into a static library the app links. The iOS
+Simulator reports the fold once the Duo is open; `--deck` (an argument of the app) lays the
+deck out at mid-height where the display has no horizontal fold, for testing.
 
 ## Platform changes
 
@@ -78,14 +124,18 @@ field is tapped and goes away on Return or a tap elsewhere.
   HDR metadata (`horizon-hdr`, Vulkan only), `proc_pidinfo` (macOS only), winit's
   `key_without_modifiers` (no keyboard layouts to learn).
 - **UIScene**: UIKit in the iOS 27 SDK refuses to launch an app without the UIScene life cycle,
-  which winit 0.30 does not adopt. `build_app.sh` records SDK 18.0 in the binary with `vtool` so
-  UIKit keeps the app-delegate life cycle. Remove it once winit's iOS backend uses scenes.
+  and an app linked against an older SDK runs boxed at old proportions on iPhone Duo's inner
+  display. `third_party/winit` is winit 0.30.13 whose iOS windows join the connected
+  `UIWindowScene` (`connected_window_scene` in `platform_impl/ios/window.rs`); `Info.plist` has
+  a scene manifest. Drop the patch once a winit release adopts scenes.
 
 ## What's left
 
 - Safe area: the HUD and screens draw under the Dynamic Island and the home indicator's corner.
-- Touch: tuning (look speed, button sizes and places, a configurable layout), item drag-splitting
-  in containers, a long press for the right click, the creative inventory's tabs, chat.
+- The deck: the hinge angle (`UIHingeInteraction`) to strengthen the reflection as the Duo folds,
+  as Mirage does; moving items on the inventory page; more pages (chat, advancements).
+- Touch: tuning (look speed, swipe thresholds), item drag-splitting in containers, a long press
+  for the right click, chat.
 - Memory and heat on devices: render distance and the worker count still use desktop defaults;
   watch for the system ending the app (jetsam) on phones with less memory.
 - The narrator (`Unsupported platform ios`), the clipboard (UIPasteboard), Game Center, an app

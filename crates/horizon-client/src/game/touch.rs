@@ -1,154 +1,123 @@
-//! Touch screens (iOS): basic controls to get playing, to be tuned later.
+//! Touch screens (iOS, iPadOS): gesture controls in the manner of the classic Pocket Edition,
+//! with no buttons and no crosshair. On iPhone Duo held upright the deck below the fold has the
+//! two sides as pads around its page view (game/deck.rs), and the game's whole view looks.
 //!
-//! In play: the left part of the screen is a floating stick (the virtual pad's left stick),
-//! dragging elsewhere turns the view as the mouse does, a quick tap there uses the item and a
-//! still press mines (the triggers), and buttons on the right jump, sneak, sprint, attack, use,
-//! open the inventory, change the camera and pause (the virtual pad's buttons, so they act as
-//! a controller's would, with its bindings). Tapping the hotbar selects a slot.
+//! In play the game's view has two halves:
+//! - **Left**: a floating stick wherever the thumb lands (the virtual pad's left stick); pushed
+//!   to its edge it sprints.
+//! - **Right**: a swipe up jumps and a swipe down crouches, both until the finger lifts; a swipe
+//!   across starts turning the view (then it turns every way); a tap opens the inventory;
+//!   holding still mines (or attacks) whatever is under the finger; a double tap uses or places
+//!   at the finger.
+//! - **Both**: a double tap with a finger on each half pauses.
+//!
+//! The hotbar takes taps to select a slot. Actions press the virtual pad's buttons, so they act
+//! as a controller's would, with its bindings.
 //!
 //! Everywhere else (the title, menus, the inventory) the first finger is the mouse: down is a
-//! left press where it touches, moving drags, up releases. Two fingers moving together scroll.
+//! left press where it touches, moving drags, up releases; two fingers scroll. A tap outside a
+//! menu opened in play closes it.
+//!
+//! Distances and speeds are in points (window pixels over the scale factor), so the gestures
+//! feel the same on every screen whatever its GUI scale.
 use super::event_loop::EventLoopCtl;
 use super::{Game, Screen};
 use horizon_client::gamepad::Button;
-use horizon_client::hud::{HudBatch, rgba};
+use horizon_client::hud::HudBatch;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use winit::dpi::PhysicalPosition;
 use winit::event::{
     DeviceId, ElementState, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
 };
 use winit::window::WindowId;
 
 /// A press held this long without moving mines (holds the attack trigger).
-const HOLD: Duration = Duration::from_millis(300);
-/// A finger moving less than this (GUI pixels) from where it touched is still a tap.
-const TAP_SLOP: f32 = 4.0;
-/// The stick's reach from where the finger touched, in GUI pixels.
-const STICK_RADIUS: f32 = 24.0;
-/// The view's turn per physical pixel of finger travel, in mouse counts.
-const LOOK_SPEED: f64 = 0.55;
-/// Button size, GUI pixels.
-const SIZE: f32 = 26.0;
-const SMALL: f32 = 18.0;
-const GAP: f32 = 6.0;
+const HOLD: Duration = Duration::from_millis(320);
+/// A tap lifts sooner than this.
+const TAP: Duration = Duration::from_millis(280);
+/// Two taps this close together are a double tap.
+const DOUBLE_TAP: Duration = Duration::from_millis(350);
+/// Taps on the two halves this close together are one tap with both hands.
+const BOTH_SIDES: Duration = Duration::from_millis(180);
+/// A finger moving less than this (points) from where it landed is still a tap.
+const TAP_SLOP: f64 = 10.0;
+/// A swipe up or down: this far (points), more vertical than horizontal.
+const SWIPE_DISTANCE: f64 = 28.0;
+/// The stick's reach from where the thumb landed, in points.
+const STICK_REACH: f64 = 45.0;
+/// Pushed this far the stick sprints.
+const SPRINT_AT: f64 = 0.92;
+/// The view's turn per point of finger travel, in mouse counts.
+const LOOK_SPEED: f64 = 1.6;
+/// The aim stays at the finger this long after a tap, for the tick that uses it.
+const AIM_LINGER: Duration = Duration::from_millis(250);
+/// Without the deck, the thumb walks from this corner of the view (fractions of its width and
+/// height, from the lower left); the rest of the view looks and acts.
+const WALK_WIDTH: f32 = 0.33;
+const WALK_HEIGHT: f32 = 0.6;
 
-/// The on-screen buttons.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Control {
-    Jump,
-    Sneak,
-    Sprint,
-    Attack,
-    Use,
-    Inventory,
-    Camera,
-    Pause,
+/// Which half of the game's view a finger landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Side {
+    /// Walking: the stick.
+    Walk,
+    /// Looking and acting.
+    Act,
 }
-
-impl Control {
-    const ALL: [Control; 8] = [
-        Control::Jump,
-        Control::Sneak,
-        Control::Sprint,
-        Control::Attack,
-        Control::Use,
-        Control::Inventory,
-        Control::Camera,
-        Control::Pause,
-    ];
-    /// The pad button it presses (the controller bindings decide what that does).
-    fn button(self) -> Button {
-        match self {
-            Control::Jump => Button::South,
-            Control::Sneak => Button::RightStick,
-            Control::Sprint => Button::LeftStick,
-            Control::Attack => Button::RightTrigger,
-            Control::Use => Button::LeftTrigger,
-            Control::Inventory => Button::North,
-            Control::Camera => Button::Select,
-            Control::Pause => Button::Start,
-        }
-    }
-    /// Its glyph: symbols, not words, so there is nothing to translate.
-    fn glyph(self) -> &'static str {
-        match self {
-            Control::Jump => "^",
-            Control::Sneak => "v",
-            Control::Sprint => ">>",
-            Control::Attack => "X",
-            Control::Use => "O",
-            Control::Inventory => "...",
-            Control::Camera => "@",
-            Control::Pause => "||",
-        }
-    }
-    /// Where it is on a GUI of `w` by `h`: x, y, size.
-    fn rect(self, w: f32, h: f32) -> [f32; 3] {
-        let col = |i: f32| w - (SIZE + GAP) * (i + 1.0) - 4.0;
-        let row = |i: f32| h - (SIZE + GAP) * (i + 1.0) - 4.0;
-        // Down the right edge, under the toasts and above the big buttons.
-        let top = |i: f32| [w - SMALL - 6.0, 46.0 + (SMALL + GAP) * i, SMALL];
-        match self {
-            Control::Jump => [col(0.0), row(0.0), SIZE],
-            Control::Sneak => [col(1.0), row(0.0), SIZE],
-            Control::Use => [col(0.0), row(1.0), SIZE],
-            Control::Attack => [col(1.0), row(1.0), SIZE],
-            Control::Sprint => [col(0.0), row(2.0), SIZE],
-            Control::Pause => top(0.0),
-            Control::Inventory => top(1.0),
-            Control::Camera => top(2.0),
-        }
-    }
-    /// Held while the finger stays down; the others are taps.
-    fn holds(self) -> bool {
-        matches!(
-            self,
-            Control::Jump | Control::Sneak | Control::Sprint | Control::Attack | Control::Use
-        )
-    }
-}
-
-/// The back button over a screen opened in play (the pad's B: close, back), top left.
-const BACK: [f32; 3] = [10.0, 30.0, SIZE];
 
 /// What one finger is doing.
 #[derive(Clone, Copy, Debug)]
-enum Role {
-    /// The left stick, centred where the finger touched (GUI pixels).
-    Stick {
-        origin: [f32; 2],
-        at: [f32; 2],
-    },
-    /// Turning the view; a tap uses, a still press mines.
-    Look {
-        last: [f64; 2],
-        start: [f32; 2],
-        since: Instant,
-        moved: bool,
-        mining: bool,
-    },
-    Button(Control),
+enum Kind {
+    /// The left stick, centred where the thumb landed.
+    Stick,
+    /// On the acting half, not yet a tap, a swipe, a look or a hold.
+    Pending,
+    /// Turning the view.
+    Look,
+    /// Swiped up: jumping (swimming up, flying up) until it lifts.
+    Jump,
+    /// Swiped down: crouching until it lifts.
+    Crouch,
+    /// Held still: mining at the finger.
+    Mine,
     /// The hotbar: nothing more once the slot is chosen.
     Hotbar,
     /// The mouse, in menus.
     Mouse,
     /// A second finger in a menu: scrolls with the first.
-    Scroll {
-        last: [f64; 2],
-    },
-    /// Lifted out of play (a screen opened): ignored until it lifts.
+    Scroll,
+    /// Done (on the deck, play ended under it): ignored until it lifts.
     Ignored,
+}
+
+#[derive(Clone, Debug)]
+struct Finger {
+    side: Side,
+    /// On the deck's pads (iPhone Duo upright) rather than the game's view: it acts at the
+    /// view's centre.
+    on_deck: bool,
+    kind: Kind,
+    /// Where it landed and where it is: points, and GUI pixels for aiming and drawing.
+    start: [f64; 2],
+    at: [f64; 2],
+    at_gui: [f32; 2],
+    since: Instant,
+}
+
+impl Finger {
+    fn travelled(&self) -> f64 {
+        distance(self.start, self.at)
+    }
 }
 
 #[derive(Default)]
 pub(super) struct TouchControls {
-    fingers: HashMap<u64, Role>,
+    fingers: HashMap<u64, Finger>,
     /// Pad buttons tapped since the last frame: the pads read them down once, and they are let
     /// go the frame after (`releasing`).
     taps: Vec<Button>,
     releasing: Vec<Button>,
-    /// The touch screen has been used: draw the controls.
+    /// The touch screen has been used.
     seen: bool,
     /// The last frame was in play.
     was_playing: bool,
@@ -156,6 +125,16 @@ pub(super) struct TouchControls {
     text_area: Option<[i32; 4]>,
     /// The on-screen keyboard is wanted: the text field was tapped.
     keyboard: bool,
+    /// The last tap on each half (where, in points), for double taps.
+    last_tap: [Option<(Instant, [f64; 2])>; 2],
+    /// The last tap with both hands, for the pause's double tap.
+    last_both: Option<Instant>,
+    /// A single tap's inventory, opened at this time if no second tap comes first.
+    inventory_at: Option<Instant>,
+    /// Where the pick aims instead of the view's centre: a point of the game's GUI, until when.
+    aim: Option<([f32; 2], Option<Instant>)>,
+    /// The field of view of the last frame, for aiming at the finger.
+    pub(super) fov: f32,
 }
 
 /// A touch as the mouse: where it is, then a left press or release.
@@ -177,34 +156,37 @@ pub(super) fn as_mouse(touch: Touch) -> Vec<WindowEvent> {
     }
 }
 
-fn inside(p: [f32; 2], r: [f32; 3]) -> bool {
-    // A little larger than drawn: fingers are wide.
-    let pad = 3.0;
-    p[0] >= r[0] - pad && p[0] < r[0] + r[2] + pad && p[1] >= r[1] - pad && p[1] < r[1] + r[2] + pad
+fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
 impl Game<'_> {
-    fn touch_playing(&self) -> bool {
+    /// The touch controls are on: iOS, or a touch screen seen elsewhere.
+    pub(super) fn touch_controls(&self) -> bool {
+        cfg!(target_os = "ios") || self.touch.seen
+    }
+
+    pub(super) fn touch_playing(&self) -> bool {
         self.title.is_none() && self.screen == Screen::Playing && self.player.is_some()
     }
 
     /// A screen open over play (the inventory, a container, the pause menu, chat).
-    fn touch_screen_over_play(&self) -> bool {
+    pub(super) fn touch_screen_over_play(&self) -> bool {
         self.title.is_none() && self.screen != Screen::Playing && self.player.is_some()
     }
 
-    fn touch_scale(&self) -> f32 {
+    pub(super) fn touch_scale(&self) -> f32 {
         self.renderer.as_ref().map_or(1.0, |r| {
             HudBatch::new([r.config.width, r.config.height]).scale
         })
     }
 
-    /// The GUI's size, in GUI pixels.
-    fn touch_gui(&self) -> (f32, f32) {
-        self.gui_size()
+    /// Window pixels per point.
+    fn touch_points(&self) -> f64 {
+        self.window.as_ref().map_or(1.0, |w| w.scale_factor())
     }
 
-    fn touch_press(&mut self, button: Button, down: bool) {
+    pub(super) fn touch_press(&mut self, button: Button, down: bool) {
         let state = self.pad.injected_mut();
         match button {
             Button::LeftTrigger => state.triggers[0] = if down { 1.0 } else { 0.0 },
@@ -213,22 +195,64 @@ impl Game<'_> {
         }
     }
 
-    fn touch_tap(&mut self, button: Button) {
+    pub(super) fn touch_tap(&mut self, button: Button) {
         self.touch_press(button, true);
         self.touch.taps.push(button);
     }
 
     /// Lets go of everything the touch controls hold on the virtual pad.
     fn touch_release_all(&mut self) {
-        for control in Control::ALL {
-            self.touch_press(control.button(), false);
+        for button in [
+            Button::LeftStick,
+            Button::RightStick,
+            Button::LeftTrigger,
+            Button::RightTrigger,
+            Button::South,
+        ] {
+            self.touch_press(button, false);
         }
         self.pad.injected_mut().left = [0.0; 2];
         self.touch.taps.clear();
         self.touch.releasing.clear();
-        for role in self.touch.fingers.values_mut() {
-            *role = Role::Ignored;
+        self.touch.aim = None;
+        for finger in self.touch.fingers.values_mut() {
+            if !matches!(finger.kind, Kind::Mouse | Kind::Scroll) {
+                finger.kind = Kind::Ignored;
+            }
         }
+    }
+
+    /// The pick's ray when a touch aims it: through the finger's point of the game, else none
+    /// (the view's centre).
+    pub(super) fn touch_aim(&self, yaw: f32, pitch: f32) -> Option<[f64; 3]> {
+        let (point, until) = self.touch.aim?;
+        if until.is_some_and(|until| Instant::now() > until) {
+            return None;
+        }
+        let (w, h) = self.gui_size();
+        // Normalised device coordinates of the point, y up.
+        let nx = f64::from(point[0] / w * 2.0 - 1.0);
+        let ny = f64::from(1.0 - point[1] / h * 2.0);
+        let fov = if self.touch.fov > 1.0 {
+            self.touch.fov
+        } else {
+            70.0
+        };
+        let half = (f64::from(fov) / 2.0).to_radians().tan();
+        let aspect = f64::from(w / h);
+        let forward = super::view_vector(yaw, pitch);
+        // Right of the view (yaw 0 faces +Z, whose right is -X), then up = right × forward.
+        let (ys, yc) = f64::from(yaw).to_radians().sin_cos();
+        let right = [-yc, 0.0, -ys];
+        let up = [
+            right[1] * forward[2] - right[2] * forward[1],
+            right[2] * forward[0] - right[0] * forward[2],
+            right[0] * forward[1] - right[1] * forward[0],
+        ];
+        let (sx, sy) = (nx * half * aspect, ny * half);
+        let dir: [f64; 3] = std::array::from_fn(|i| forward[i] + right[i] * sx + up[i] * sy);
+        let len = dir.iter().map(|v| v * v).sum::<f64>().sqrt();
+        Some(dir.map(|v| v / len))
     }
 
     /// winit's touch event.
@@ -241,47 +265,73 @@ impl Game<'_> {
         self.touch.seen = true;
         self.last_input = Instant::now();
         let scale = self.touch_scale();
+        let points = self.touch_points();
         let gui = [
             touch.location.x as f32 / scale,
             touch.location.y as f32 / scale,
         ];
-        let finger = touch.id;
+        let at = [touch.location.x / points, touch.location.y / points];
+        let now = Instant::now();
         if touch.phase == TouchPhase::Started {
-            let role = if self.touch_playing() {
-                self.touch_role_in_play(gui, touch.location)
-            } else if self.touch_screen_over_play() && inside(gui, BACK) {
-                self.touch_tap(Button::East);
-                Role::Ignored
+            let (w, h) = self.gui_size();
+            // iPhone Duo upright: the deck's sides are the pads (its card is SwiftUI's, which
+            // takes its own touches), and the game's whole view looks. Elsewhere the thumb walks
+            // from the lower left corner and the rest of the view looks.
+            let zone = self.deck_zone(&touch);
+            let on_deck = zone.is_some();
+            let side = match zone {
+                Some(Some(side)) => side,
+                Some(None) => Side::Act,
+                None if self.deck_up() => Side::Act,
+                None if gui[0] < w * WALK_WIDTH && gui[1] > h * (1.0 - WALK_HEIGHT) => Side::Walk,
+                None => Side::Act,
+            };
+            let kind = if zone == Some(None) || (on_deck && !self.touch_playing()) {
+                Kind::Ignored
+            } else if on_deck {
+                self.touch_land_on_pad(side)
+            } else if self.touch_playing() {
+                self.touch_land_in_play(gui, side)
             } else if self
                 .touch
                 .fingers
                 .values()
-                .any(|r| matches!(r, Role::Mouse))
+                .any(|f| matches!(f.kind, Kind::Mouse))
             {
-                Role::Scroll {
-                    last: [touch.location.x, touch.location.y],
-                }
+                Kind::Scroll
             } else {
-                Role::Mouse
+                Kind::Mouse
             };
-            self.touch.fingers.insert(finger, role);
+            if matches!(kind, Kind::Mouse) {
+                // A tap on the text field brings the keyboard up; anywhere else puts it away.
+                let (x, y) = (touch.location.x as i32, touch.location.y as i32);
+                self.touch.keyboard = self.touch.text_area.is_some_and(|[ax, ay, aw, ah]| {
+                    let slop = 40;
+                    x >= ax - slop && x < ax + aw + slop && y >= ay - slop && y < ay + ah + slop
+                });
+            }
+            self.touch.fingers.insert(
+                touch.id,
+                Finger {
+                    side,
+                    on_deck,
+                    kind,
+                    start: at,
+                    at,
+                    at_gui: gui,
+                    since: now,
+                },
+            );
         }
-        let Some(role) = self.touch.fingers.get(&finger).copied() else {
+        let Some(mut finger) = self.touch.fingers.remove(&touch.id) else {
             return;
         };
-        if touch.phase == TouchPhase::Started
-            && matches!(self.touch.fingers.get(&finger), Some(Role::Mouse))
-        {
-            // A tap on the text field brings the keyboard up; anywhere else puts it away.
-            let (x, y) = (touch.location.x as i32, touch.location.y as i32);
-            self.touch.keyboard = self.touch.text_area.is_some_and(|[ax, ay, aw, ah]| {
-                let slop = 40;
-                x >= ax - slop && x < ax + aw + slop && y >= ay - slop && y < ay + ah + slop
-            });
-        }
         let ended = matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled);
-        match role {
-            Role::Mouse => {
+        let last = finger.at;
+        finger.at = at;
+        finger.at_gui = gui;
+        match finger.kind {
+            Kind::Mouse => {
                 for event in as_mouse(touch) {
                     self.handle_window_event(
                         event_loop,
@@ -290,126 +340,217 @@ impl Game<'_> {
                         super::input_trace::InputOrigin::User,
                     );
                 }
+                if ended
+                    && finger.since.elapsed() < TAP
+                    && finger.travelled() <= TAP_SLOP
+                    && self.touch_tapped_outside_menu()
+                {
+                    self.touch_tap(Button::East);
+                }
             }
-            Role::Scroll { last } => {
-                let now = [touch.location.x, touch.location.y];
-                let dy = (now[1] - last[1]) / f64::from(scale) / 12.0;
-                if dy.abs() >= 1.0 {
+            Kind::Scroll => {
+                let dy = (at[1] - last[1]) / 12.0;
+                if dy != 0.0 {
                     self.handle_window_event(
                         event_loop,
                         id,
                         WindowEvent::MouseWheel {
                             device_id: DeviceId::dummy(),
-                            delta: MouseScrollDelta::LineDelta(0.0, dy.round() as f32),
+                            delta: MouseScrollDelta::LineDelta(0.0, dy as f32),
                             phase: TouchPhase::Moved,
                         },
                         super::input_trace::InputOrigin::User,
                     );
-                    self.touch
-                        .fingers
-                        .insert(finger, Role::Scroll { last: now });
                 }
             }
-            Role::Stick { origin, .. } => {
+            Kind::Stick => {
                 let mut v = [
-                    (gui[0] - origin[0]) / STICK_RADIUS,
-                    -(gui[1] - origin[1]) / STICK_RADIUS,
+                    (at[0] - finger.start[0]) / STICK_REACH,
+                    -(at[1] - finger.start[1]) / STICK_REACH,
                 ];
                 let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
                 if len > 1.0 {
                     v = [v[0] / len, v[1] / len];
                 }
-                self.pad.injected_mut().left = if ended { [0.0; 2] } else { v };
-                self.touch
-                    .fingers
-                    .insert(finger, Role::Stick { origin, at: gui });
-            }
-            Role::Look {
-                last,
-                start,
-                since,
-                mut moved,
-                mining,
-            } => {
-                let now = [touch.location.x, touch.location.y];
-                let (dx, dy) = (now[0] - last[0], now[1] - last[1]);
-                if !moved {
-                    let (sx, sy) = (gui[0] - start[0], gui[1] - start[1]);
-                    moved = (sx * sx + sy * sy).sqrt() > TAP_SLOP;
-                }
-                if moved && (dx != 0.0 || dy != 0.0) {
-                    self.mouse
-                        .on_move(0.0, 0.0, dx * LOOK_SPEED, dy * LOOK_SPEED, true, true);
-                }
-                if ended {
-                    if mining {
-                        self.touch_press(Button::RightTrigger, false);
-                    } else if !moved && since.elapsed() < HOLD {
-                        self.touch_tap(Button::LeftTrigger);
-                    }
+                // Pushed to the edge, mostly forward: sprint, as the stick's click does.
+                let sprint = !ended && len >= SPRINT_AT && v[1] > 0.5;
+                self.touch_press(Button::LeftStick, sprint);
+                self.pad.injected_mut().left = if ended {
+                    [0.0; 2]
                 } else {
-                    self.touch.fingers.insert(
-                        finger,
-                        Role::Look {
-                            last: now,
-                            start,
-                            since,
-                            moved,
-                            mining,
-                        },
-                    );
+                    [v[0] as f32, v[1] as f32]
+                };
+                if ended && finger.since.elapsed() < TAP && finger.travelled() <= TAP_SLOP {
+                    self.touch_tapped(&finger);
                 }
             }
-            Role::Button(control) => {
-                if ended && control.holds() {
-                    self.touch_press(control.button(), false);
+            Kind::Pending => self.touch_pending(&mut finger, ended),
+            Kind::Look => self.touch_look(at[0] - last[0], at[1] - last[1]),
+            Kind::Jump if ended => self.touch_press(Button::South, false),
+            Kind::Crouch if ended => self.touch_press(Button::RightStick, false),
+            Kind::Mine => {
+                if ended {
+                    self.touch_press(Button::RightTrigger, false);
+                    self.touch.aim = None;
+                } else if !finger.on_deck {
+                    // Mining follows the finger.
+                    self.touch.aim = Some((gui, None));
                 }
             }
-            Role::Hotbar | Role::Ignored => {}
+            _ => {}
         }
-        if ended {
-            self.touch.fingers.remove(&finger);
+        if !ended {
+            self.touch.fingers.insert(touch.id, finger);
         }
     }
 
-    /// What a finger touching down at `gui` does in play.
-    fn touch_role_in_play(&mut self, gui: [f32; 2], at: PhysicalPosition<f64>) -> Role {
-        let (w, h) = self.touch_gui();
-        for control in Control::ALL {
-            if inside(gui, control.rect(w, h)) {
-                if control.holds() {
-                    self.touch_press(control.button(), true);
-                } else {
-                    self.touch_tap(control.button());
-                }
-                return Role::Button(control);
+    /// A finger on the acting half that is not yet anything: a tap when it lifts, a swipe up
+    /// (jump) or down (crouch) when it moves more vertically than across, else a look.
+    fn touch_pending(&mut self, finger: &mut Finger, ended: bool) {
+        let travelled = finger.travelled();
+        if ended {
+            if finger.since.elapsed() < TAP && travelled <= TAP_SLOP {
+                self.touch_tapped(finger);
             }
+            return;
         }
+        if travelled <= TAP_SLOP {
+            return;
+        }
+        let (dx, dy) = (
+            finger.at[0] - finger.start[0],
+            finger.at[1] - finger.start[1],
+        );
+        if dy.abs() > dx.abs() {
+            // Up or down: a swipe once it has gone far enough.
+            if dy.abs() >= SWIPE_DISTANCE {
+                let (button, kind) = if dy < 0.0 {
+                    (Button::South, Kind::Jump)
+                } else {
+                    (Button::RightStick, Kind::Crouch)
+                };
+                self.touch_press(button, true);
+                finger.kind = kind;
+            }
+        } else {
+            // Across: a look, from here on, on the game's view or the deck's pad alike. The
+            // way it came counts past the tap's slop: a quick swipe arrives in few moves, and
+            // dropping them all would barely turn the view; the slop itself is left out, so the
+            // view doesn't jump as the look starts.
+            finger.kind = Kind::Look;
+            let past = (travelled - TAP_SLOP).max(0.0) / travelled;
+            self.touch_look(dx * past, dy * past);
+        }
+    }
+
+    /// What a finger landing at `gui` does in play.
+    fn touch_land_in_play(&mut self, gui: [f32; 2], side: Side) -> Kind {
+        let (w, h) = self.gui_size();
         // The hotbar: 182 by 22 GUI pixels, centred at the bottom (Gui.extractItemHotbar).
         let left = (w / 2.0 - 91.0).floor();
         if gui[1] >= h - 22.0 && gui[0] >= left && gui[0] < left + 182.0 {
             let slot = (((gui[0] - left - 1.0) / 20.0) as usize).min(8);
             self.hotbar_presses.push(slot);
-            return Role::Hotbar;
+            return Kind::Hotbar;
         }
         let stick_taken = self
             .touch
             .fingers
             .values()
-            .any(|r| matches!(r, Role::Stick { .. }));
-        if gui[0] < w * 0.4 && gui[1] > h * 0.25 && !stick_taken {
-            return Role::Stick {
-                origin: gui,
-                at: gui,
-            };
+            .any(|f| matches!(f.kind, Kind::Stick));
+        match side {
+            Side::Walk if !stick_taken => Kind::Stick,
+            Side::Walk => Kind::Ignored,
+            Side::Act => Kind::Pending,
         }
-        Role::Look {
-            last: [at.x, at.y],
-            start: gui,
-            since: Instant::now(),
-            moved: false,
-            mining: false,
+    }
+
+    /// What a finger landing on one of the deck's pads does in play.
+    fn touch_land_on_pad(&mut self, side: Side) -> Kind {
+        let stick_taken = self
+            .touch
+            .fingers
+            .values()
+            .any(|f| matches!(f.kind, Kind::Stick));
+        match side {
+            Side::Walk if !stick_taken => Kind::Stick,
+            Side::Walk => Kind::Ignored,
+            Side::Act => Kind::Pending,
         }
+    }
+
+    fn touch_look(&mut self, dx: f64, dy: f64) {
+        if dx != 0.0 || dy != 0.0 {
+            self.mouse
+                .on_move(0.0, 0.0, dx * LOOK_SPEED, dy * LOOK_SPEED, true, true);
+        }
+    }
+
+    /// A tap on one half: the inventory (once the double tap's window has passed), a double
+    /// tap's use, or half of the pause's double tap with both hands.
+    fn touch_tapped(&mut self, finger: &Finger) {
+        let now = Instant::now();
+        let side = finger.side as usize;
+        let other = 1 - side;
+        // The other hand tapped at the same time: a tap with both hands, not a jump.
+        if self.touch.last_tap[other].is_some_and(|(at, _)| now - at <= BOTH_SIDES) {
+            self.touch.last_tap = [None, None];
+            self.touch.inventory_at = None;
+            if self
+                .touch
+                .last_both
+                .is_some_and(|at| now - at <= DOUBLE_TAP + BOTH_SIDES)
+            {
+                self.touch.last_both = None;
+                self.touch_tap(Button::Start);
+            } else {
+                self.touch.last_both = Some(now);
+            }
+            return;
+        }
+        let previous = self.touch.last_tap[side].replace((now, finger.at));
+        if finger.side == Side::Walk {
+            return;
+        }
+        if previous.is_some_and(|(at, p)| now - at <= DOUBLE_TAP && distance(p, finger.at) < 40.0) {
+            // A double tap: use or place at the finger.
+            self.touch.last_tap[side] = None;
+            self.touch.inventory_at = None;
+            self.touch.aim = (!finger.on_deck).then_some((finger.at_gui, Some(now + AIM_LINGER)));
+            self.touch_tap(Button::LeftTrigger);
+        } else {
+            // A single tap opens the inventory, unless a second tap makes it a double tap.
+            self.touch.inventory_at = Some(now + DOUBLE_TAP);
+        }
+    }
+
+    /// The tap just given to a menu opened in play fell outside it: on no slot or panel of a
+    /// container screen (`hasClickedOutside`) with nothing carried, or on no widget of another.
+    fn touch_tapped_outside_menu(&self) -> bool {
+        if !self.touch_screen_over_play() || self.carried.is_some() {
+            return false;
+        }
+        // Screens that type take taps for their text.
+        if matches!(
+            self.screen,
+            Screen::Chat | Screen::CommandBlock | Screen::Options | Screen::Social
+        ) || self.sign_edit.is_some()
+            || self.book.is_some()
+        {
+            return false;
+        }
+        let Some(r) = &self.renderer else {
+            return false;
+        };
+        let batch = HudBatch::new([r.config.width, r.config.height]);
+        if matches!(self.screen, Screen::Inventory | Screen::Creative) {
+            return self.clicked_outside(&batch);
+        }
+        let (x, y) = self.cursor;
+        let grow = 4.0;
+        !horizon_client::widgets::last().iter().any(|w| {
+            x >= w.x - grow && x < w.x + w.w + grow && y >= w.y - grow && y < w.y + w.h + grow
+        })
     }
 
     /// Whether the input method (the on-screen keyboard) may show while a text field has focus:
@@ -443,112 +584,34 @@ impl Game<'_> {
         }
         self.touch.was_playing = playing;
         if !playing {
+            self.touch.inventory_at = None;
             return;
         }
-        let mut mine = false;
-        for role in self.touch.fingers.values_mut() {
-            if let Role::Look {
-                since,
-                moved: false,
-                mining,
-                ..
-            } = role
-                && !*mining
-                && since.elapsed() >= HOLD
+        if self
+            .touch
+            .inventory_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.touch.inventory_at = None;
+            self.touch_tap(Button::North);
+        }
+        let mut mine = None;
+        for finger in self.touch.fingers.values_mut() {
+            if matches!(finger.kind, Kind::Pending)
+                && finger.since.elapsed() >= HOLD
+                // A finger already on its way (a swipe deciding) is no hold.
+                && finger.travelled() <= TAP_SLOP
             {
-                *mining = true;
-                mine = true;
+                finger.kind = Kind::Mine;
+                mine = Some((!finger.on_deck).then_some(finger.at_gui));
             }
         }
-        if mine {
+        if let Some(at) = mine {
+            self.touch.aim = at.map(|at| (at, None));
             self.touch_press(Button::RightTrigger, true);
         }
     }
 
-    /// The controls over play, once the touch screen is in use (always on iOS).
-    pub(super) fn draw_touch_controls(&self, batch: &mut HudBatch) {
-        if !(self.touch.seen || cfg!(target_os = "ios")) {
-            return;
-        }
-        let atlas = &self.gui.atlas;
-        if self.touch_screen_over_play() {
-            draw_button(batch, atlas, BACK, "<", false);
-            return;
-        }
-        if !self.touch_playing() {
-            return;
-        }
-        let (w, h) = (batch.width, batch.height);
-        let held: Vec<Control> = self
-            .touch
-            .fingers
-            .values()
-            .filter_map(|r| match r {
-                Role::Button(c) => Some(*c),
-                _ => None,
-            })
-            .collect();
-        for control in Control::ALL {
-            let down = held.contains(&control);
-            draw_button(batch, atlas, control.rect(w, h), control.glyph(), down);
-        }
-        for role in self.touch.fingers.values() {
-            if let Role::Stick { origin, at } = role {
-                let r = STICK_RADIUS;
-                batch.fill(
-                    atlas,
-                    origin[0] - r,
-                    origin[1] - r,
-                    r * 2.0,
-                    r * 2.0,
-                    rgba(0, 0, 0, 70),
-                );
-                let (mut dx, mut dy) = (at[0] - origin[0], at[1] - origin[1]);
-                let len = (dx * dx + dy * dy).sqrt();
-                if len > r {
-                    dx *= r / len;
-                    dy *= r / len;
-                }
-                let k = 9.0;
-                batch.fill(
-                    atlas,
-                    origin[0] + dx - k,
-                    origin[1] + dy - k,
-                    k * 2.0,
-                    k * 2.0,
-                    rgba(255, 255, 255, 120),
-                );
-            }
-        }
-    }
-}
-
-/// One button: a translucent square, its edge and its glyph.
-fn draw_button(
-    batch: &mut HudBatch,
-    atlas: &horizon_client::hud::HudAtlas,
-    [x, y, s]: [f32; 3],
-    glyph: &str,
-    down: bool,
-) {
-    let fill = if down {
-        rgba(255, 255, 255, 110)
-    } else {
-        rgba(0, 0, 0, 90)
-    };
-    batch.fill(atlas, x, y, s, s, fill);
-    let edge = rgba(255, 255, 255, 120);
-    batch.fill(atlas, x, y, s, 1.0, edge);
-    batch.fill(atlas, x, y + s - 1.0, s, 1.0, edge);
-    batch.fill(atlas, x, y, 1.0, s, edge);
-    batch.fill(atlas, x + s - 1.0, y, 1.0, s, edge);
-    let tw = HudBatch::text_width(atlas, glyph);
-    batch.text(
-        atlas,
-        glyph,
-        (x + (s - tw) / 2.0).round(),
-        (y + (s - 8.0) / 2.0).round(),
-        u32::MAX,
-        true,
-    );
+    /// The controls draw nothing: the gestures need no buttons or stick to see.
+    pub(super) fn draw_touch_controls(&self, _batch: &mut HudBatch) {}
 }

@@ -49,6 +49,13 @@ developers, with upstream fixes applied
 [gfx-rs/wgpu#10714](https://github.com/gfx-rs/wgpu/pull/10714)). It is licensed under MIT or
 Apache-2.0; both licenses are in that folder (`LICENSE.MIT`, `LICENSE.APACHE`).
 
+## winit
+
+`third_party/winit` is [winit](https://github.com/rust-windowing/winit) 0.30.13 by the winit
+contributors, whose iOS windows join the app's `UIWindowScene` (`connected_window_scene` in
+`src/platform_impl/ios/window.rs`): UIKit in the iOS 27 SDK needs the UIScene life cycle
+(docs/ios.md). It is licensed under Apache-2.0; the license is in that folder (`LICENSE`).
+
 ## naga
 
 `third_party/naga` is [naga](https://github.com/gfx-rs/wgpu) 30.0.1 by the gfx-rs developers, with

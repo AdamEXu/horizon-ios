@@ -160,7 +160,26 @@ impl Game<'_> {
     /// Refresh the minimap's tiles within the frame budget, recompose its
     /// image when the view or a tile changed, and queue the upload.
     fn update_minimap(&mut self) {
-        let Some((_, _, view)) = self.minimap_shown() else {
+        // iPhone Duo's deck has a map page: north up, a block a pixel.
+        let deck_view = self
+            .deck_shows_map()
+            .then_some(self.player.as_ref())
+            .flatten()
+            .map(|p| {
+                (
+                    Corner::TopLeft,
+                    0.0,
+                    View {
+                        x: p.position.x,
+                        z: p.position.z,
+                        yaw: self.yaw,
+                        rotate: true,
+                        blocks_per_pixel: 1.0,
+                        round: false,
+                    },
+                )
+            });
+        let Some((_, _, view)) = self.minimap_shown().or(deck_view) else {
             if self.minimap_wanted().is_none() || self.player.is_none() {
                 self.extras.minimap.clear();
                 self.extras.minimap_dim = None;

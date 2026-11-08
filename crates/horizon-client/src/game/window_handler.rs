@@ -157,6 +157,7 @@ impl Game<'_> {
         if self.pending_save.is_some() {
             return;
         }
+        self.deck_frame();
         self.touch_frame();
         horizon_client::spans::time("pads", || self.poll_pads(event_loop));
         self.pause_if_inactive();
@@ -257,6 +258,13 @@ impl ApplicationHandler for Game<'_> {
             self.touch_event(event_loop, id, touch);
             return;
         }
+        // iPhone Duo upright: the game's part of the window is above the fold.
+        let event = match event {
+            WindowEvent::Resized(size) if self.window.as_ref().is_some_and(|w| w.id() == id) => {
+                WindowEvent::Resized(self.deck_resized(size))
+            }
+            event => event,
+        };
         let key = if self.window.as_ref().is_some_and(|w| w.id() == id)
             && let WindowEvent::KeyboardInput {
                 event,

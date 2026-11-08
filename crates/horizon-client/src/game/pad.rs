@@ -342,10 +342,16 @@ impl Game<'_> {
         }
         let threshold = self.settings.controller.trigger_threshold;
         let edges = self.pad.edges.update(&state, threshold);
-        if activity && self.pad_focused() {
+        // The touch controls press the virtual pad too, but they are not a controller: no
+        // glyphs or button guide for them (a real pad's input still shows them).
+        let touch_only = self.touch_controls() && hardware == PadState::default();
+        if activity && self.pad_focused() && !touch_only {
             self.last_input = Instant::now();
             self.pad.in_use = true;
             self.pad.keyboard_took_over = false;
+        }
+        if touch_only && activity {
+            self.pad.in_use = false;
         }
         self.pad.state = state;
         self.pad_drop_frame();

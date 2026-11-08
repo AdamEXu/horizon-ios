@@ -1,9 +1,14 @@
 //! Horizon on iOS: the app's executable. iOS starts it with no command line, so it builds the
 //! game's: the resources inside the app bundle, the game folder in the app's Documents (visible
 //! in the Files app), the log and crash reports beside it.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::path::PathBuf;
+
+#[cfg(target_os = "ios")]
+mod display;
+#[cfg(target_os = "ios")]
+mod pager;
 
 #[global_allocator]
 static ALLOCATOR: horizon_threads::Allocator = horizon_threads::ALLOCATOR;
@@ -35,7 +40,20 @@ fn main() {
         "--home".to_owned(),
         horizon_home.display().to_string(),
     ];
-    // Extra arguments for development: `simctl launch <device> <id> --world Test`.
-    args.extend(std::env::args().skip(1));
+    #[cfg(target_os = "ios")]
+    horizon_client_input::window::install_display_shape(display::shape);
+    #[cfg(target_os = "ios")]
+    horizon_client_input::window::install_pager(pager::HOST);
+    // Extra arguments for development: `simctl launch <device> <id> --world Test`. `--deck`
+    // lays out iPhone Duo's upright deck at mid-height where the display has no such fold
+    // (the Simulator never turns the inner display upright).
+    for arg in std::env::args().skip(1) {
+        if arg == "--deck" {
+            horizon_client_input::window::FORCE_DIVISION
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            args.push(arg);
+        }
+    }
     horizon_client::entry::main_with_args(args);
 }

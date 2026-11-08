@@ -274,7 +274,10 @@ impl Game<'_> {
             "Saving world...",
             progress,
         );
-        renderer.render(&loading_frame(&hud))?;
+        if renderer.render(&loading_frame(&hud))? {
+            // iPhone Duo upright: the deck presents the window.
+            self.present_deck()?;
+        }
         Ok(())
     }
 }
