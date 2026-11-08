@@ -74,13 +74,18 @@ screens, chat and native mods take it unchanged.
 |---|---|
 | Keys | The desktop's keys and bindings (WASD, Space, Shift, E, the digits, T and `/`, Esc, F1 to F12 where the keyboard has them), held keys repeat |
 | Text | Typed through UIKit while a text field has focus, in the keyboard's own layout; the on-screen keyboard stays away |
-| Mouse in play | The pointer is locked and hidden; its movement turns the view (raw, as the desktop's grabbed mouse), left attacks, right uses, middle picks, the wheel changes the hotbar slot |
-| Mouse over screens | The game draws its cursor: hover, tooltips, slot hover, clicks, drags and the wheel as on the desktop |
+| Mouse in play | The pointer is locked and hidden, as the desktop grabs the mouse; its raw movement turns the view, left attacks, right uses, middle picks, the wheel changes the hotbar slot |
+| Mouse over screens | The system's own pointer, with its speed and scroll settings: hover, tooltips, slot hover, clicks, drags and scrolling as on the desktop |
 
 The touch controls hide once a key is pressed, a mouse button clicked or the pointer moved a
 little (a palm brushing the trackpad doesn't count), and come back when a finger touches the
 screen. The log says which is in use (`keyboard and mouse are the input in use`, `touch is the
-input in use`), and when a keyboard or mouse connects and the pointer locks.
+input in use`), when a keyboard or mouse connects, and each pointer lock asked for and granted
+(`pointer lock wanted`, `pointer lock requested`, `the system's pointer lock changed`, `pointer
+locked`).
+
+Touches the controls make on the virtual pad don't count as a controller: no controller guide,
+glyphs or menu focus appear for them.
 
 ## Platform changes
 
@@ -95,17 +100,20 @@ input in use`), and when a keyboard or mouse connects and the pointer locks.
 - **No pointer to grab**: `capture` keeps the grab as the game's own state on iOS, as for
   offscreen runs; touch and a hardware mouse turn the view through `MouseHandler.onMove`.
 - **Keyboard and mouse**: winit 0.30's iOS backend sends no hardware key presses (only
-  `insertText:` while its view has the keyboard focus) and turns the pointer into touches. Keys,
-  mouse motion, buttons and the wheel come from GameController's `GCKeyboard` and `GCMouse`
-  instead, polled once a frame. The pointer stays locked while the mouse is in use, over screens
-  too: the game draws its own cursor there, moved by the same raw motion, so hover needs no
-  button held and the cursor doesn't jump when a screen opens or closes. winit's view controller
-  gets a `prefersPointerLocked` method for this. A gesture recognizer that sees only
-  `UITouchTypeIndirectPointer` touches marks the pointer's clicks, which are then ignored as
-  touches (when the system doesn't lock the pointer they place the game's cursor). The wheel
-  assumes natural scrolling, iPadOS' default. `horizon-ios-input` builds winit's `KeyEvent`
-  itself, which relies on its iOS `platform_specific` field being empty (a size check fails the
-  build if a winit update changes that).
+  `insertText:` while its view has the keyboard focus) and turns the pointer into touches. Keys
+  come from GameController's `GCKeyboard`. The pointer is locked only while the game holds it
+  (`capture`): winit's view controller gets a `prefersPointerLocked` method, and the game asks
+  again if the system hasn't locked it within a second. In play, movement, buttons and the wheel
+  come from `GCMouse`. Over screens they come from UIKit, on recognizers added to winit's view
+  that hold no touch back from it: a `UIHoverGestureRecognizer` for hovering, one that sees only
+  `UITouchTypeIndirectPointer` touches for presses, drags and releases (the event's
+  `buttonMask` says which button; each moves the cursor to the event's place first, and those
+  touches never reach the touch controls), and a `UIPanGestureRecognizer` that takes only
+  scrolling. Pointer places reported while the pointer is locked are dropped: the system then
+  still sends clicks as touches, at the window's corner. The in-play wheel assumes natural
+  scrolling, iPadOS' default. `horizon-ios-input` builds winit's `KeyEvent` itself, which relies
+  on its iOS `platform_specific` field being empty (a size check fails the build if a winit
+  update changes that).
 - **Main thread stack**: iOS gives the main thread 1 MB and the startup overflowed it;
   `crates/horizon-ios/build.rs` links the app with a 16 MB one.
 - **Crates that don't build for iOS**: `arboard` (the clipboard stays in the game), the Vulkan
@@ -121,11 +129,11 @@ input in use`), and when a keyboard or mouse connects and the pointer locks.
 - Touch: tuning (look speed, button sizes and places, a configurable layout), item drag-splitting
   in containers, a long press for the right click, the creative inventory's tabs, chat.
 - Keyboard and mouse: the edit shortcuts (copy, paste, select all) use Control as on Windows and
-  Linux, not Command; the cursor in menus follows GameController's raw motion, not the system's
-  pointer speed setting; the scroll direction doesn't follow the system's natural-scrolling
-  setting; the startup menu (before the resources load) types with a US layout; where the system
-  declines to lock the pointer, its own pointer shows beside the game's cursor. Game controllers
-  (`GCController`) aren't read yet.
+  Linux, not Command; the wheel in play doesn't follow the system's natural-scrolling setting;
+  a screen opened from play keeps the cursor in the middle until the pointer moves or clicks
+  (iPadOS can't move its pointer there); a button other than left or right may not reach screens
+  if the system makes no touch for it; the startup menu (before the resources load) types with a
+  US layout. Game controllers (`GCController`) aren't read yet.
 - Memory and heat on devices: render distance and the worker count still use desktop defaults;
   watch for the system ending the app (jetsam) on phones with less memory.
 - The narrator (`Unsupported platform ios`), the clipboard (UIPasteboard), Game Center, an app
