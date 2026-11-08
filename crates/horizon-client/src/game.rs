@@ -167,6 +167,7 @@ mod glowing;
 mod golems;
 mod growth;
 mod hand;
+mod hardware_input;
 mod headless;
 mod hud_editor;
 mod ime;
@@ -2527,6 +2528,8 @@ struct Game<'a> {
     touch: touch::TouchControls,
     /// iPhone Duo upright: the control deck below the fold (game/deck.rs).
     deck: deck::Deck,
+    /// A hardware keyboard and mouse on iPadOS (game/hardware_input.rs).
+    hardware: hardware_input::HardwareInput,
     frames: u64,
     /// The glint clock and options, read once at the start of each frame
     /// (game/item_draw.rs).
@@ -16249,6 +16252,7 @@ impl<'a> Game<'a> {
             pad: Default::default(),
             touch: Default::default(),
             deck: Default::default(),
+            hardware: Default::default(),
             frames: 0,
             glint_frame: Default::default(),
             kept_block_entities: Default::default(),
@@ -17084,6 +17088,7 @@ fn run_loading(
         ui_at: None,
         title_drawn: false,
         menu,
+        hardware: Default::default(),
         error: None,
     };
     let mut app = App::Loading(Box::new(loading));

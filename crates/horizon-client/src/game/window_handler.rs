@@ -158,6 +158,7 @@ impl Game<'_> {
             return;
         }
         self.deck_frame();
+        self.hardware_input(event_loop);
         self.touch_frame();
         horizon_client::spans::time("pads", || self.poll_pads(event_loop));
         self.pause_if_inactive();
@@ -258,6 +259,36 @@ impl ApplicationHandler for Game<'_> {
             self.touch_event(event_loop, id, touch);
             return;
         }
+        if Self::hardware_drops(&event) {
+            return;
+        }
+        self.user_window_event(event_loop, id, event);
+    }
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta: (x, y) } = event {
+            self.mouse_motion(event_loop, x, y);
+        }
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.idle(event_loop);
+    }
+    /// The application is ending. On macOS, Quit (Cmd+Q) ends it through
+    /// applicationWillTerminate without a CloseRequested; vanilla's GLFW
+    /// window turns it into a window close, so Minecraft.stop saves the world.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.shut_down();
+    }
+}
+
+impl Game<'_> {
+    /// A window event from the player's devices: winit's, or a hardware keyboard's and mouse's
+    /// on iPadOS (game/hardware_input.rs).
+    pub(super) fn user_window_event(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: WindowId,
+        event: WindowEvent,
+    ) {
         // iPhone Duo upright: the game's part of the window is above the fold.
         let event = match event {
             WindowEvent::Resized(size) if self.window.as_ref().is_some_and(|w| w.id() == id) => {
@@ -281,7 +312,8 @@ impl ApplicationHandler for Game<'_> {
             self.native_input_key(&event, modifiers);
         }
     }
-    fn device_event(&mut self, event_loop: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+    /// Raw mouse motion (`DeviceEvent::MouseMotion`, or a hardware mouse's on iPadOS).
+    pub(super) fn mouse_motion(&mut self, event_loop: &dyn EventLoopCtl, x: f64, y: f64) {
         // A composited view renders offscreen but its keyboard/mouse owner still
         // controls a visible native window. A headless offscreen run never does.
         if self.pending_save.is_none()
@@ -290,7 +322,6 @@ impl ApplicationHandler for Game<'_> {
             && self.keyboard_mouse
             && (!self.options.offscreen || self.split_window)
             && self.screen == Screen::Playing
-            && let DeviceEvent::MouseMotion { delta: (x, y) } = event
         {
             if x != 0.0 || y != 0.0 {
                 self.pad_yield_input(event_loop);
@@ -303,14 +334,5 @@ impl ApplicationHandler for Game<'_> {
             self.mouse.on_move(0.0, 0.0, x, y, true, true);
             self.last_input = Instant::now();
         }
-    }
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.idle(event_loop);
-    }
-    /// The application is ending. On macOS, Quit (Cmd+Q) ends it through
-    /// applicationWillTerminate without a CloseRequested; vanilla's GLFW
-    /// window turns it into a window close, so Minecraft.stop saves the world.
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.shut_down();
     }
 }

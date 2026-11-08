@@ -156,6 +156,13 @@ pub(super) fn as_mouse(touch: Touch) -> Vec<WindowEvent> {
     }
 }
 
+/// A touch the pointer of a connected mouse made (a click, a trackpad press): the mouse's own
+/// input (game/hardware_input.rs) has its buttons and place already.
+pub(super) fn is_pointer(touch: &Touch) -> bool {
+    let ended = matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled);
+    horizon_ios_input::pointer_touch(touch.id, ended) && horizon_ios_input::mouse_connected()
+}
+
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
@@ -187,7 +194,7 @@ impl Game<'_> {
     }
 
     pub(super) fn touch_press(&mut self, button: Button, down: bool) {
-        let state = self.pad.injected_mut();
+        let state = self.pad.touch_mut();
         match button {
             Button::LeftTrigger => state.triggers[0] = if down { 1.0 } else { 0.0 },
             Button::RightTrigger => state.triggers[1] = if down { 1.0 } else { 0.0 },
@@ -211,7 +218,7 @@ impl Game<'_> {
         ] {
             self.touch_press(button, false);
         }
-        self.pad.injected_mut().left = [0.0; 2];
+        self.pad.touch_mut().left = [0.0; 2];
         self.touch.taps.clear();
         self.touch.releasing.clear();
         self.touch.aim = None;
@@ -262,6 +269,12 @@ impl Game<'_> {
         id: WindowId,
         touch: Touch,
     ) {
+        if is_pointer(&touch) {
+            return;
+        }
+        if touch.phase == TouchPhase::Started {
+            self.hardware.touched();
+        }
         self.touch.seen = true;
         self.last_input = Instant::now();
         let scale = self.touch_scale();
@@ -375,7 +388,7 @@ impl Game<'_> {
                 // Pushed to the edge, mostly forward: sprint, as the stick's click does.
                 let sprint = !ended && len >= SPRINT_AT && v[1] > 0.5;
                 self.touch_press(Button::LeftStick, sprint);
-                self.pad.injected_mut().left = if ended {
+                self.pad.touch_mut().left = if ended {
                     [0.0; 2]
                 } else {
                     [v[0] as f32, v[1] as f32]
@@ -560,7 +573,9 @@ impl Game<'_> {
             self.touch.keyboard = false;
             self.touch.text_area = None;
         }
-        !cfg!(target_os = "ios") || self.touch.keyboard
+        // A hardware keyboard leaves the screen free: UIKit shows no keyboard, and the field
+        // needs its text input.
+        !cfg!(target_os = "ios") || self.touch.keyboard || horizon_ios_input::keyboard_connected()
     }
 
     pub(super) fn touch_keyboard_done(&mut self) {

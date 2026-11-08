@@ -1,10 +1,15 @@
-//! On iOS: compiles the SwiftUI deck (`swift/`) into a static library the app links.
+//! On iOS: compiles the SwiftUI deck (`swift/`) into a static library the app links, and gives the
+//! main thread a 16 MB stack: iOS gives it 1 MB, and the game's startup overflows that
+//! (`Renderer::new`), more than the 8 MB main thread the desktop systems give.
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=swift");
     println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-stack_size,0x1000000");
+    }
     let target = std::env::var("TARGET").unwrap_or_default();
     let (sdk, triple, platform) = match target.as_str() {
         "aarch64-apple-ios-sim" => (

@@ -1364,6 +1364,7 @@ mod tests {
             ui_at: None,
             title_drawn: false,
             menu: StartupMenu::default(),
+            hardware: Default::default(),
             error: None,
         }
     }

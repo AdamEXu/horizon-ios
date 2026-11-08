@@ -6,7 +6,8 @@ The game runs on iPhone and iPad through wgpu's Metal backend. The iOS app is th
 server code the desktop game runs.
 
 Status: early. The game boots, renders the title screen and worlds through Metal, single
-player works (on its integrated server thread), and touch controls cover the basics. Expect
+player works (on its integrated server thread), touch controls cover the basics, and an iPad
+plays with a hardware keyboard and mouse or trackpad as the desktop game does. Expect
 rough edges: see [What's left](#whats-left).
 
 ## Build and run (simulator)
@@ -108,6 +109,30 @@ its sides and, pressed into the metal between them with padding, a card holding 
 Simulator reports the fold once the Duo is open; `--deck` (an argument of the app) lays the
 deck out at mid-height where the display has no horizontal fold, for testing.
 
+## Keyboard and mouse
+
+`crates/horizon-ios-input` (GameController) and `crates/horizon-client/src/game/hardware_input.rs`.
+A keyboard and a mouse or trackpad (the Magic Keyboard's included) play as on the desktop: their
+input becomes the window events the desktop's keyboard and mouse send, so the key bindings,
+screens, chat and native mods take it unchanged.
+
+| Device | What |
+|---|---|
+| Keys | The desktop's keys and bindings (WASD, Space, Shift, E, the digits, T and `/`, Esc, F1 to F12 where the keyboard has them), held keys repeat |
+| Text | Typed through UIKit while a text field has focus, in the keyboard's own layout; the on-screen keyboard stays away |
+| Mouse in play | The pointer is locked and hidden, as the desktop grabs the mouse; its raw movement turns the view, left attacks, right uses, middle picks, the wheel changes the hotbar slot |
+| Mouse over screens | The system's own pointer, with its speed and scroll settings: hover, tooltips, slot hover, clicks, drags and scrolling as on the desktop |
+
+The touch controls hide once a key is pressed, a mouse button clicked or the pointer moved a
+little (a palm brushing the trackpad doesn't count), and come back when a finger touches the
+screen. The log says which is in use (`keyboard and mouse are the input in use`, `touch is the
+input in use`), when a keyboard or mouse connects, and each pointer lock asked for and granted
+(`pointer lock wanted`, `pointer lock requested`, `the system's pointer lock changed`, `pointer
+locked`).
+
+Touches the controls make on the virtual pad don't count as a controller: no controller guide,
+glyphs or menu focus appear for them.
+
 ## Platform changes
 
 - **Metal only**: `backend_order` takes wgpu's default on iOS as on macOS; the options hide the
@@ -119,7 +144,24 @@ deck out at mid-height where the display has no horizontal fold, for testing.
   `window::for_platform` drops the desktop window size and fullscreen, keeps landscape and defers
   the system's edge gestures.
 - **No pointer to grab**: `capture` keeps the grab as the game's own state on iOS, as for
-  offscreen runs; touch turns the view through `MouseHandler.onMove`.
+  offscreen runs; touch and a hardware mouse turn the view through `MouseHandler.onMove`.
+- **Keyboard and mouse**: winit 0.30's iOS backend sends no hardware key presses (only
+  `insertText:` while its view has the keyboard focus) and turns the pointer into touches. Keys
+  come from GameController's `GCKeyboard`. The pointer is locked only while the game holds it
+  (`capture`): winit's view controller gets a `prefersPointerLocked` method, and the game asks
+  again if the system hasn't locked it within a second. In play, movement, buttons and the wheel
+  come from `GCMouse`. Over screens they come from UIKit, on recognizers added to winit's view
+  that hold no touch back from it: a `UIHoverGestureRecognizer` for hovering, one that sees only
+  `UITouchTypeIndirectPointer` touches for presses, drags and releases (the event's
+  `buttonMask` says which button; each moves the cursor to the event's place first, and those
+  touches never reach the touch controls), and a `UIPanGestureRecognizer` that takes only
+  scrolling. Pointer places reported while the pointer is locked are dropped: the system then
+  still sends clicks as touches, at the window's corner. The in-play wheel assumes natural
+  scrolling, iPadOS' default. `horizon-ios-input` builds winit's `KeyEvent` itself, which relies
+  on its iOS `platform_specific` field being empty (a size check fails the build if a winit
+  update changes that).
+- **Main thread stack**: iOS gives the main thread 1 MB and the startup overflowed it;
+  `crates/horizon-ios/build.rs` links the app with a 16 MB one.
 - **Crates that don't build for iOS**: `arboard` (the clipboard stays in the game), the Vulkan
   HDR metadata (`horizon-hdr`, Vulkan only), `proc_pidinfo` (macOS only), winit's
   `key_without_modifiers` (no keyboard layouts to learn).
@@ -136,6 +178,12 @@ deck out at mid-height where the display has no horizontal fold, for testing.
   as Mirage does; moving items on the inventory page; more pages (chat, advancements).
 - Touch: tuning (look speed, swipe thresholds), item drag-splitting in containers, a long press
   for the right click, chat.
+- Keyboard and mouse: the edit shortcuts (copy, paste, select all) use Control as on Windows and
+  Linux, not Command; the wheel in play doesn't follow the system's natural-scrolling setting;
+  a screen opened from play keeps the cursor in the middle until the pointer moves or clicks
+  (iPadOS can't move its pointer there); a button other than left or right may not reach screens
+  if the system makes no touch for it; the startup menu (before the resources load) types with a
+  US layout. Game controllers (`GCController`) aren't read yet.
 - Memory and heat on devices: render distance and the worker count still use desktop defaults;
   watch for the system ending the app (jetsam) on phones with less memory.
 - The narrator (`Unsupported platform ios`), the clipboard (UIPasteboard), Game Center, an app

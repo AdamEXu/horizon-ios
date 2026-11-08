@@ -25,6 +25,8 @@ horizon-optifine = { path = "../horizon-optifine" }
 # The server thread ahead of the workers (MinecraftServer.spin's Thread.setPriority).
 horizon-threads = { path = "../horizon-threads" }
 horizon-hdr = { path = "../horizon-hdr" }
+# Hardware keyboards and mice on iPadOS (game/hardware_input.rs); nothing elsewhere.
+horizon-ios-input = { path = "../horizon-ios-input" }
 horizon-world = { path = "../horizon-world" }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
